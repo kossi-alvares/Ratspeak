@@ -90,6 +90,107 @@ pub async fn spawn_lxmf_propagation_handler(
     });
 }
 
+/// Register the `nomadnetwork.node` handler and spawn the per-event processor.
+/// Feeds `AppState.discovered_nomad_nodes`, the address book behind the
+/// Browser panel's node picker (see `crate::state::AppState`).
+pub async fn spawn_nomad_node_handler(
+    state: Arc<AppState>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    shutdown: ShutdownSignal,
+) {
+    let (htx, mut hrx) = mpsc::channel::<AnnounceHandlerEvent>(HANDLER_CHANNEL_CAP);
+    if !register_with_retry(
+        &transport_tx,
+        Some(nomad_core::announce::APP_NAME.to_string()),
+        false,
+        htx,
+    )
+    .await
+    {
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.wait() => break,
+                ev = hrx.recv() => match ev {
+                    Some(event) => process_nomad_node_announce(&state, event).await,
+                    None => break,
+                },
+            }
+        }
+    });
+}
+
+/// `nomadnetwork.node` per-event processing: just refresh the address book
+/// entry. No path-response gate (unlike lxmf/propagation) since `receive_path_responses`
+/// is `false` for this handler — every event here is a live announce.
+async fn process_nomad_node_announce(state: &Arc<AppState>, event: AnnounceHandlerEvent) {
+    let Some(identity_hash) = event.identity_hash else {
+        return;
+    };
+
+    let hash_hex = hex::encode(event.destination_hash);
+    let display_name = event
+        .app_data
+        .as_deref()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+
+    let identity_hash_hex = hex::encode(identity_hash);
+    let last_seen = now_f64();
+    let entry = json!({
+        "identity_hash": identity_hash_hex,
+        "display_name": display_name,
+        "hops": event.hops,
+        "last_seen": last_seen,
+    });
+
+    if let Ok(mut nodes) = state.discovered_nomad_nodes.lock() {
+        nodes.insert(hash_hex.clone(), entry);
+        evict_nomad_nodes_over_cap(&mut nodes);
+    }
+
+    // Persisted so the Browser panel's picker survives a restart. Announces
+    // are one-shot broadcasts and a node may not re-announce for hours, so an
+    // in-memory-only list leaves a known node unreachable from the list until
+    // it happens to announce again.
+    let hops = event.hops;
+    let _ = db::spawn_db(state.db.clone(), move |pool| {
+        db::upsert_discovered_nomad_node(
+            &pool,
+            &hash_hex,
+            &identity_hash_hex,
+            &display_name,
+            Some(hops),
+            last_seen,
+            crate::state::MAX_DISCOVERED_NOMAD_NODES,
+        );
+    })
+    .await;
+}
+
+/// Matches reticulum-meshchat's capped recent-announces list: once over
+/// `MAX_DISCOVERED_NOMAD_NODES`, drop the least-recently-seen entries first.
+fn evict_nomad_nodes_over_cap(nodes: &mut std::collections::HashMap<String, serde_json::Value>) {
+    if nodes.len() <= crate::state::MAX_DISCOVERED_NOMAD_NODES {
+        return;
+    }
+    let to_drop = nodes.len() - crate::state::MAX_DISCOVERED_NOMAD_NODES;
+    let mut by_last_seen: Vec<(String, f64)> = nodes
+        .iter()
+        .map(|(k, v)| {
+            let last_seen = v.get("last_seen").and_then(|t| t.as_f64()).unwrap_or(0.0);
+            (k.clone(), last_seen)
+        })
+        .collect();
+    by_last_seen.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (key, _) in by_last_seen.into_iter().take(to_drop) {
+        nodes.remove(&key);
+    }
+}
+
 /// Register the lxst.telephony handler and map announces onto their associated
 /// LXMF peer rows. This keeps the visible peers list service-aware without
 /// inserting standalone NomadNet or propagation-node destinations.
@@ -564,5 +665,106 @@ mod tests {
     fn path_responses_do_not_touch_peer_activity() {
         assert!(!should_touch_peer_activity(&event_with_path_response(true)));
         assert!(should_touch_peer_activity(&event_with_path_response(false)));
+    }
+
+    fn make_state() -> Arc<AppState> {
+        let config = crate::config::DashboardConfig::from_env_and_defaults(std::env::temp_dir());
+        let mgr = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
+        Arc::new(AppState::new(
+            config,
+            pool,
+            std::sync::Arc::new(ratspeak_core::NoopEmitter),
+            std::sync::Arc::new(ratspeak_core::NoopNotifier),
+        ))
+    }
+
+    #[tokio::test]
+    async fn nomad_node_announce_populates_discovered_nodes() {
+        let state = make_state();
+        let event = AnnounceHandlerEvent {
+            destination_hash: [0x11; 16],
+            identity_hash: Some([0x22; 16]),
+            announce_packet_hash: [0x33; 32],
+            is_path_response: false,
+            hops: 4,
+            app_data: Some(b"My Node".to_vec()),
+            public_key: None,
+            ratchet: None,
+            name_hash: [0x44; 10],
+        };
+
+        process_nomad_node_announce(&state, event).await;
+
+        let nodes = state.discovered_nomad_nodes.lock().unwrap();
+        let entry = nodes.get(&hex::encode([0x11; 16])).expect("entry present");
+        assert_eq!(entry["identity_hash"], json!(hex::encode([0x22; 16])));
+        assert_eq!(entry["display_name"], json!("My Node"));
+        assert_eq!(entry["hops"], json!(4));
+    }
+
+    #[tokio::test]
+    async fn nomad_node_announce_without_identity_hash_is_dropped() {
+        let state = make_state();
+        let event = AnnounceHandlerEvent {
+            destination_hash: [0x55; 16],
+            identity_hash: None,
+            announce_packet_hash: [0x33; 32],
+            is_path_response: false,
+            hops: 1,
+            app_data: None,
+            public_key: None,
+            ratchet: None,
+            name_hash: [0x44; 10],
+        };
+
+        process_nomad_node_announce(&state, event).await;
+
+        assert!(state.discovered_nomad_nodes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nomad_node_announces_evict_oldest_over_cap() {
+        let state = make_state();
+        for i in 0..(crate::state::MAX_DISCOVERED_NOMAD_NODES + 10) {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let event = AnnounceHandlerEvent {
+                destination_hash: hash,
+                identity_hash: Some(hash),
+                announce_packet_hash: [0u8; 32],
+                is_path_response: false,
+                hops: 1,
+                app_data: None,
+                public_key: None,
+                ratchet: None,
+                name_hash: [0u8; 10],
+            };
+            process_nomad_node_announce(&state, event).await;
+            // Distinct, increasing last_seen per entry so eviction order is
+            // deterministic instead of racing the system clock.
+            let key = hex::encode(hash);
+            if let Ok(mut nodes) = state.discovered_nomad_nodes.lock()
+                && let Some(entry) = nodes.get_mut(&key)
+                && let Some(obj) = entry.as_object_mut()
+            {
+                obj.insert("last_seen".to_string(), json!(i as f64));
+            }
+        }
+
+        let nodes = state.discovered_nomad_nodes.lock().unwrap();
+        assert_eq!(nodes.len(), crate::state::MAX_DISCOVERED_NOMAD_NODES);
+        // The 10 oldest (lowest last_seen, i.e. i=0..10) should be evicted.
+        for i in 0..10 {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(
+                !nodes.contains_key(&hex::encode(hash)),
+                "node {i} should have been evicted"
+            );
+        }
+        let mut newest = [0u8; 16];
+        newest[..8].copy_from_slice(&((crate::state::MAX_DISCOVERED_NOMAD_NODES + 9) as u64).to_be_bytes());
+        assert!(nodes.contains_key(&hex::encode(newest)));
     }
 }

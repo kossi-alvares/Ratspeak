@@ -94,6 +94,10 @@
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="6" height="6" rx="1"/><rect x="16" y="2" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="12" y1="13" x2="12" y2="16"/></svg>
             <span class="nav-label">Network</span>
         </a>
+        <a class="nav-item" data-view="browser" href="#browser" title="Browser">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/><path d="M2 8h20M2 16h20"/></svg>
+            <span class="nav-label">Browser</span>
+        </a>
         <a class="nav-item" data-view="settings" href="#settings" title="Settings">
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span class="nav-label">Settings</span>
@@ -176,6 +180,10 @@
             <a class="bottom-sheet-item" data-view="network">
                 <svg viewBox="0 0 24 24"><rect x="2" y="2" width="6" height="6" rx="1"/><rect x="16" y="2" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="12" y1="13" x2="12" y2="16"/></svg>
                 Network
+            </a>
+            <a class="bottom-sheet-item" data-view="browser">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/><path d="M2 8h20M2 16h20"/></svg>
+                Browser
             </a>
             <div class="bottom-sheet-divider"></div>
             <a class="bottom-sheet-item" data-view="settings">
@@ -967,6 +975,33 @@
             </div>
         </div>
 
+        <div class="view" id="view-browser">
+            <div class="panel full-height">
+                <div class="panel-header">
+                    <span>Browser</span>
+                </div>
+                <form class="browser-addressbar" id="browser-addressbar">
+                    <button class="panel-header-btn browser-nav-btn" id="browser-back" type="button" title="Back" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                    </button>
+                    <button class="panel-header-btn browser-nav-btn" id="browser-forward" type="button" title="Forward" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
+                    <input class="nr-input" id="browser-address-input" type="text" placeholder="nomad://&lt;identity-hash&gt;/page/index.mu" autocomplete="off" spellcheck="false">
+                    <button class="nr-btn nr-btn-primary" type="submit">Go</button>
+                </form>
+                <div class="panel-body browser-body">
+                    <div class="browser-nodes" id="browser-nodes">
+                        <input class="nr-input-sm browser-nodes-search" id="browser-nodes-search" type="text" placeholder="Filter pages" autocomplete="off">
+                        <div class="browser-nodes-list" id="browser-nodes-list">
+                            <div class="loading-state"><span class="loading-spinner"></span>Discovering nodes...</div>
+                        </div>
+                    </div>
+                    <iframe class="browser-frame" id="browser-frame" title="NomadNet page"></iframe>
+                </div>
+            </div>
+        </div>
+
         <div class="view" id="view-settings">
             <div class="settings-page settings-detail-mode">
                 <div class="settings-page-shell">
@@ -1709,6 +1744,7 @@
 <script src="/static/js/identity.js"></script>
 <script src="/static/js/confetti.js"></script>
 <script src="/static/js/games_tab.js"></script>
+<script src="/static/js/browser.js"></script>
 <script src="/static/js/tauri_events.js"></script>
 <script src="/static/js/init_dom_handlers.js"></script>
 </body>

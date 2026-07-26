@@ -683,8 +683,52 @@ fn has_plain_identity_material(ratspeak_dir: &std::path::Path) -> bool {
             .unwrap_or(false)
 }
 
+/// Repopulate the Browser panel's node picker from the last session. Announces
+/// are one-shot broadcasts, so without this a node already known to the user
+/// stays absent from the list until it happens to announce again — which for a
+/// default nodepage-rs is up to `announce_interval_minutes` (6h) away.
+async fn restore_discovered_nomad_nodes(state: &Arc<AppState>) {
+    let rows = match db::spawn_db(state.db.clone(), |pool| {
+        db::load_discovered_nomad_nodes(&pool, crate::state::MAX_DISCOVERED_NOMAD_NODES)
+    })
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not load discovered nomad nodes");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+
+    let Ok(mut nodes) = state.discovered_nomad_nodes.lock() else {
+        return;
+    };
+    let restored = rows.len();
+    for row in rows {
+        let Some(dest_hash) = row.get("dest_hash").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Keyed by dest_hash to match the announce handler, so a live announce
+        // updates the restored entry in place rather than duplicating it.
+        nodes.insert(
+            dest_hash.to_string(),
+            serde_json::json!({
+                "identity_hash": row.get("identity_hash").and_then(|v| v.as_str()).unwrap_or(""),
+                "display_name": row.get("display_name").and_then(|v| v.as_str()).unwrap_or(""),
+                "hops": row.get("hops").cloned().unwrap_or(serde_json::Value::Null),
+                "last_seen": row.get("last_seen").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            }),
+        );
+    }
+    tracing::info!(count = restored, "restored discovered nomad nodes");
+}
+
 pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
     propagation::seed_static_nodes(&state);
+    restore_discovered_nomad_nodes(&state).await;
 
     let ratspeak_dir = data_dir.join(".ratspeak");
     let has_identity = has_identity_material(&ratspeak_dir);
@@ -1940,6 +1984,12 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                 )
                 .await;
                 announce_handlers::spawn_lxst_telephony_handler(
+                    state.clone(),
+                    transport_tx_for_handler.clone(),
+                    shutdown.clone(),
+                )
+                .await;
+                announce_handlers::spawn_nomad_node_handler(
                     state.clone(),
                     transport_tx_for_handler,
                     shutdown,

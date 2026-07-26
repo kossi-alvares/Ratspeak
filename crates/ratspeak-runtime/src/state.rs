@@ -16,7 +16,8 @@ use crate::lxmf::LxmfManager;
 use crate::rns::RnsManager;
 
 pub use ratspeak_core::types::{
-    LrgpMsgMeta, MAX_DISCOVERED_PROPAGATION_NODES, PROPAGATION_NODE_TTL_SECS,
+    LrgpMsgMeta, MAX_DISCOVERED_NOMAD_NODES, MAX_DISCOVERED_PROPAGATION_NODES,
+    PROPAGATION_NODE_TTL_SECS,
 };
 pub use ratspeak_db::DbPool;
 
@@ -65,6 +66,10 @@ pub struct AppState {
     pub last_hub_interfaces: RwLock<Option<serde_json::Value>>,
     pub lxmf_notify: Arc<tokio::sync::Notify>,
     pub discovered_propagation_nodes: Mutex<HashMap<String, serde_json::Value>>,
+    /// Keyed by dest_hash hex; `nomadnetwork.node` peers discovered via
+    /// announce, for the Browser panel's node-picker. Session-local, not
+    /// persisted (same as `discovered_propagation_nodes`).
+    pub discovered_nomad_nodes: Mutex<HashMap<String, serde_json::Value>>,
     pub network_log_enabled: AtomicBool,
     /// One of "essential" | "standard" | "detailed".
     pub network_log_level: RwLock<String>,
@@ -211,6 +216,7 @@ impl AppState {
             last_hub_interfaces: RwLock::new(None),
             lxmf_notify: Arc::new(tokio::sync::Notify::new()),
             discovered_propagation_nodes: Mutex::new(HashMap::new()),
+            discovered_nomad_nodes: Mutex::new(HashMap::new()),
             network_log_enabled: AtomicBool::new(false),
             network_log_level: RwLock::new("standard".into()),
             announce_interval_tx,
@@ -370,6 +376,9 @@ impl AppState {
             *hub = None;
         }
         if let Ok(mut nodes) = self.discovered_propagation_nodes.lock() {
+            nodes.clear();
+        }
+        if let Ok(mut nodes) = self.discovered_nomad_nodes.lock() {
             nodes.clear();
         }
         if let Ok(mut node) = self.auto_active_node.write() {

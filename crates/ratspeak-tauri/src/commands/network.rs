@@ -173,6 +173,28 @@ pub async fn api_propagation_nodes(state: State<'_, Arc<AppState>>) -> AppResult
     Ok(json!(nodes))
 }
 
+/// Discovered `nomadnetwork.node` peers, for the Browser panel's node picker.
+#[tauri::command]
+pub async fn api_nomad_nodes(state: State<'_, Arc<AppState>>) -> AppResult<Value> {
+    let nodes: Vec<Value> = state
+        .discovered_nomad_nodes
+        .lock()
+        .map(|registry| {
+            registry
+                .iter()
+                .map(|(dest_hash, v)| {
+                    let mut out = v.clone();
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert("dest_hash".to_string(), json!(dest_hash));
+                    }
+                    out
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!(nodes))
+}
+
 /// 10s throttle. Returns `{ kind: "throttled" | "offline" | "sent", count? }`.
 #[tauri::command]
 pub async fn refresh_propagation_nodes(state: State<'_, Arc<AppState>>) -> AppResult<Value> {

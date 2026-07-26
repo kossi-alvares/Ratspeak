@@ -264,6 +264,66 @@ fn open_external_url(url: String) -> Result<(), String> {
     }
 }
 
+/// CSP applied to every `nomad://` response. `script-src 'none'` is the part
+/// that matters: it stops inline handlers and `javascript:` targets from
+/// running even if a page slips past the Micron sanitiser or is served as
+/// raw HTML by the remote node.
+const NOMAD_FRAME_CSP: &str = "default-src 'none'; \
+     img-src 'self' data:; \
+     style-src 'unsafe-inline'; \
+     font-src data:; \
+     script-src 'none'; \
+     object-src 'none'; \
+     form-action 'none'; \
+     base-uri 'none'";
+
+fn nomad_error_response(status: u16, message: &str) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(message.as_bytes().to_vec())
+        .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+}
+
+/// Backs the `nomad://<identity-hash-hex>/page/<name>` (or `/file/<name>`)
+/// custom scheme; fetch + Micron rendering lives in `ratspeak_tauri::nomad_browser`.
+async fn handle_nomad_request(
+    app_handle: tauri::AppHandle,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    let Some(state) = app_handle.try_state::<std::sync::Arc<ratspeak_tauri::state::AppState>>()
+    else {
+        return nomad_error_response(503, "Ratspeak core is not ready");
+    };
+    let state = state.inner().clone();
+
+    let host = request.uri().host().unwrap_or("").to_string();
+    let path = request.uri().path().to_string();
+
+    match ratspeak_tauri::nomad_browser::fetch_for_uri(&state, &host, &path).await {
+        Ok(resp) => {
+            let mut builder = tauri::http::Response::builder()
+                .status(200)
+                .header("Content-Type", resp.content_type)
+                // Remote-authored content rendered in a real webview. The app's
+                // own CSP does not extend to this scheme's responses, so the
+                // frame gets its own: no script execution, no external loads,
+                // and no plugin/embed content, whatever the page contains.
+                .header("Content-Security-Policy", NOMAD_FRAME_CSP);
+            if let Some(name) = resp.attachment_name {
+                builder = builder.header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}\"", name.replace('"', "")),
+                );
+            }
+            builder
+                .body(resp.body)
+                .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+        }
+        Err(e) => nomad_error_response(502, &e),
+    }
+}
+
 #[cfg(target_os = "ios")]
 fn open_external_url_ios(url: &str) -> Result<(), String> {
     use objc2::msg_send;
@@ -573,6 +633,14 @@ pub fn run() {
         show_main_window(app);
     }));
 
+    let builder =
+        builder.register_asynchronous_uri_scheme_protocol("nomad", |ctx, request, responder| {
+            let app_handle = ctx.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                responder.respond(handle_nomad_request(app_handle, request).await);
+            });
+        });
+
     // Mobile haptics bridge — navigator.vibrate is a no-op in WKWebView so
     // iOS needs UIImpactFeedbackGenerator via this plugin.
     #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -596,6 +664,7 @@ pub fn run() {
             ratspeak_tauri::commands::network::api_alerts,
             ratspeak_tauri::commands::network::api_propagation,
             ratspeak_tauri::commands::network::api_propagation_nodes,
+            ratspeak_tauri::commands::network::api_nomad_nodes,
             ratspeak_tauri::commands::network::api_hub_interfaces,
             ratspeak_tauri::commands::messaging::api_conversation,
             ratspeak_tauri::commands::messaging::api_lxmf_conversations,
@@ -822,12 +891,26 @@ pub fn run() {
                 ""
             };
             let initialization_script = format!("{platform_script}{diagnostics_script}");
+            // The nomad:// iframe's origin differs from the app's own, so the parent
+            // can't read iframe.contentWindow.location cross-origin to keep the address
+            // bar in sync with in-page link clicks. Have each nomad:// document report
+            // its own href back via postMessage instead.
+            const NOMAD_ADDRESS_SYNC_SCRIPT: &str = r#"
+                if (location.protocol === 'nomad:') {
+                    window.addEventListener('DOMContentLoaded', function () {
+                        window.parent.postMessage({ type: 'nomad-nav', href: location.href }, '*');
+                    });
+                }
+            "#;
+
+
             let window = tauri::WebviewWindowBuilder::new(
                 &handle,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
-            .initialization_script(initialization_script);
+            .initialization_script(initialization_script)
+            .initialization_script_for_all_frames(NOMAD_ADDRESS_SYNC_SCRIPT);
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let window = window

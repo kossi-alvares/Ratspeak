@@ -1,10 +1,10 @@
 var currentView = 'dashboard';
-var VIEWS = ['dashboard', 'message', 'contacts', 'identity', 'peers', 'network', 'games', 'settings'];
+var VIEWS = ['dashboard', 'message', 'contacts', 'identity', 'peers', 'network', 'games', 'browser', 'settings'];
 
 // Tab-bar destinations use replaceState; MORE_VIEWS live under the hamburger.
-var TAB_VIEWS = ['peers', 'message', 'contacts', 'identity', 'network', 'games', 'settings'];
+var TAB_VIEWS = ['peers', 'message', 'contacts', 'identity', 'network', 'games', 'browser', 'settings'];
 var PRIMARY_TAB_VIEWS = ['peers', 'message', 'contacts'];
-var MORE_VIEWS = ['identity', 'network', 'games', 'settings'];
+var MORE_VIEWS = ['identity', 'network', 'games', 'browser', 'settings'];
 var MOBILE_TAB_SLOTS = ['peers', 'message', 'contacts', 'more'];
 var DEFAULT_MORE_VIEW = 'identity';
 var _lastMoreView = DEFAULT_MORE_VIEW;
@@ -406,6 +406,10 @@ var VIEW_LIFECYCLE = {
 
     games: function() {
         if (typeof gamesTabLoad === 'function') gamesTabLoad();
+    },
+
+    browser: function() {
+        if (typeof browserTabLoad === 'function') browserTabLoad();
     },
 
     peers: function() {

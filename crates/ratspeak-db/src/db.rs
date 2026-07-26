@@ -8,7 +8,7 @@ use tokio::task::JoinError;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 
 pub const PEER_SERVICE_LXMF_DELIVERY: &str = ratspeak_core::LXMF_DELIVERY_APP_NAME;
 pub const PEER_SERVICE_LXST_TELEPHONY: &str = "lxst.telephony";
@@ -202,6 +202,20 @@ CREATE TABLE IF NOT EXISTS pending_blackholes (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_blackholes_dest ON pending_blackholes(dest_hash);
 CREATE INDEX IF NOT EXISTS idx_pending_blackholes_identity ON pending_blackholes(identity_id);
+
+-- `nomadnetwork.node` peers seen via announce, for the Browser panel's node
+-- picker. Persisted so the picker is not empty after a restart: announces are
+-- one-shot broadcasts and a node may only re-announce hours later, so without
+-- this a known node is unreachable from the list until it announces again.
+CREATE TABLE IF NOT EXISTS discovered_nomad_nodes (
+    dest_hash       TEXT PRIMARY KEY,
+    identity_hash   TEXT NOT NULL DEFAULT '',
+    display_name    TEXT NOT NULL DEFAULT '',
+    hops            INTEGER DEFAULT NULL,
+    last_seen       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_nomad_nodes_last_seen
+    ON discovered_nomad_nodes(last_seen);
 
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -1252,6 +1266,25 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<(), rusqlite::
         })?;
     }
 
+    if from_version < 34 {
+        migration_step(conn, 34, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS discovered_nomad_nodes (
+                    dest_hash       TEXT PRIMARY KEY,
+                    identity_hash   TEXT NOT NULL DEFAULT '',
+                    display_name    TEXT NOT NULL DEFAULT '',
+                    hops            INTEGER DEFAULT NULL,
+                    last_seen       REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_discovered_nomad_nodes_last_seen
+                    ON discovered_nomad_nodes(last_seen);",
+            )?;
+            conn.execute_batch("UPDATE schema_version SET version = 34;")?;
+            tracing::info!("Migrated to schema version 34 (discovered nomad nodes)");
+            Ok(())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1439,6 +1472,7 @@ pub const RESET_TABLES: &[&str] = &[
     "blocked_contacts",
     "identity_activity",
     "pending_blackholes",
+    "discovered_nomad_nodes",
 ];
 
 /// Per-identity cascade for `delete_identity`. Static DELETEs (no format!()
@@ -2951,6 +2985,88 @@ pub fn delete_identity_activity(pool: &DbPool, hashes: &[String]) -> usize {
     deleted
 }
 
+/// Load persisted `nomadnetwork.node` peers, most-recently-seen first, capped
+/// at `limit`. Feeds `AppState.discovered_nomad_nodes` at startup so the
+/// Browser panel's picker survives a restart.
+pub fn load_discovered_nomad_nodes(pool: &DbPool, limit: usize) -> Vec<serde_json::Value> {
+    let Ok(conn) = pool.get() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT dest_hash, identity_hash, display_name, hops, last_seen
+         FROM discovered_nomad_nodes
+         ORDER BY last_seen DESC
+         LIMIT ?1",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        let dest_hash: String = row.get(0)?;
+        let identity_hash: String = row.get(1)?;
+        let display_name: String = row.get(2)?;
+        let hops: Option<i64> = row.get(3)?;
+        let last_seen: f64 = row.get(4)?;
+        Ok(serde_json::json!({
+            "dest_hash": dest_hash,
+            "identity_hash": identity_hash,
+            "display_name": display_name,
+            "hops": hops,
+            "last_seen": last_seen,
+        }))
+    });
+    match rows {
+        Ok(iter) => iter.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Upsert one discovered node and trim the table back to `cap` rows, dropping
+/// the least-recently-seen first — the same eviction rule the in-memory map
+/// uses, so the two cannot drift.
+pub fn upsert_discovered_nomad_node(
+    pool: &DbPool,
+    dest_hash: &str,
+    identity_hash: &str,
+    display_name: &str,
+    hops: Option<u8>,
+    last_seen: f64,
+    cap: usize,
+) {
+    let Ok(conn) = pool.get() else {
+        return;
+    };
+    if conn
+        .execute(
+            "INSERT INTO discovered_nomad_nodes
+                (dest_hash, identity_hash, display_name, hops, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(dest_hash) DO UPDATE SET
+                identity_hash = excluded.identity_hash,
+                display_name  = excluded.display_name,
+                hops          = excluded.hops,
+                last_seen     = excluded.last_seen",
+            params![
+                dest_hash,
+                identity_hash,
+                display_name,
+                hops.map(|h| h as i64),
+                last_seen
+            ],
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = conn.execute(
+        "DELETE FROM discovered_nomad_nodes
+         WHERE dest_hash NOT IN (
+             SELECT dest_hash FROM discovered_nomad_nodes
+             ORDER BY last_seen DESC LIMIT ?1
+         )",
+        params![cap as i64],
+    );
+}
+
 /// Clear discovered peer activity while preserving rows needed by user data.
 ///
 /// Contacts, blocked identities, message counterparties, and configured
@@ -3714,6 +3830,48 @@ mod unread_breakdown_tests {
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
         init_schema(&pool).unwrap();
         pool
+    }
+
+    #[test]
+    fn discovered_nomad_nodes_round_trip_and_upsert() {
+        let pool = test_pool();
+        upsert_discovered_nomad_node(&pool, "aa", "id_a", "Node A", Some(2), 100.0, 500);
+        upsert_discovered_nomad_node(&pool, "bb", "id_b", "Node B", Some(1), 200.0, 500);
+
+        let rows = load_discovered_nomad_nodes(&pool, 500);
+        assert_eq!(rows.len(), 2);
+        // Most-recently-seen first.
+        assert_eq!(rows[0]["dest_hash"], "bb");
+        assert_eq!(rows[0]["display_name"], "Node B");
+        assert_eq!(rows[0]["hops"], 1);
+
+        // Re-announce updates in place rather than duplicating.
+        upsert_discovered_nomad_node(&pool, "aa", "id_a", "Node A renamed", Some(3), 300.0, 500);
+        let rows = load_discovered_nomad_nodes(&pool, 500);
+        assert_eq!(rows.len(), 2, "upsert must not duplicate: {rows:?}");
+        assert_eq!(rows[0]["dest_hash"], "aa");
+        assert_eq!(rows[0]["display_name"], "Node A renamed");
+        assert_eq!(rows[0]["hops"], 3);
+    }
+
+    #[test]
+    fn discovered_nomad_nodes_evicts_least_recently_seen_over_cap() {
+        let pool = test_pool();
+        for i in 0..5 {
+            upsert_discovered_nomad_node(
+                &pool,
+                &format!("h{i}"),
+                "id",
+                "n",
+                Some(1),
+                i as f64,
+                3,
+            );
+        }
+        let rows = load_discovered_nomad_nodes(&pool, 500);
+        assert_eq!(rows.len(), 3, "cap not enforced: {rows:?}");
+        let kept: Vec<&str> = rows.iter().map(|r| r["dest_hash"].as_str().unwrap()).collect();
+        assert_eq!(kept, vec!["h4", "h3", "h2"], "wrong rows evicted");
     }
 
     // Test fixture mirrors the subset of message columns under assertion.

@@ -42,6 +42,7 @@ rns-runtime = { workspace = true }
 rns-ratkey = { workspace = true, optional = true }
 lxmf-core = { workspace = true }
 lrgp = { workspace = true }
+nomad-core = { workspace = true }
 lxst-core = { workspace = true, optional = true }
 lxst-rns = { workspace = true, optional = true }
 lxst-telephony = { workspace = true, optional = true }

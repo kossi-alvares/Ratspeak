@@ -37,6 +37,9 @@ pub const MAX_DISCOVERED_PROPAGATION_NODES: usize = 512;
 /// 48h matches the RNS path-table expiry convention (`PATHFINDER_E`).
 pub const PROPAGATION_NODE_TTL_SECS: u64 = 48 * 3600;
 
+/// Matches reticulum-meshchat's recent-announces cap for `nomadnetwork.node`.
+pub const MAX_DISCOVERED_NOMAD_NODES: usize = 500;
+
 /// LXMF destination app-names (wire strings shared by runtime, db, and tauri).
 pub const LXMF_DELIVERY_APP_NAME: &str = "lxmf.delivery";
 pub const LXMF_PROPAGATION_APP_NAME: &str = "lxmf.propagation";

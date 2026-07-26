@@ -4,6 +4,7 @@ exclude = ["src-tauri"]
 members = [
     "crates/ratspeak-core",
     "crates/ratspeak-db",
+    "crates/ratspeak-nomad",
     "crates/ratspeak-runtime",
     "crates/ratspeak-tauri",
 ]
@@ -37,8 +38,12 @@ lxst-telephony = { path = "../rsLXST/crates/lxst-telephony" }
 # --- Internal crates ---
 # lrgp lives in the sibling lrgp-rs/ repo until we adopt crates.io publishing.
 lrgp = { path = "../lrgp-rs" }
+# nomad-core lives in the sibling rsNodePage/ repo; reused here only for its
+# APP_NAME constant and page/file request-path conventions.
+nomad-core = { path = "../rsNodePage/crates/nomad-core" }
 ratspeak-core = { path = "crates/ratspeak-core" }
 ratspeak-db = { path = "crates/ratspeak-db" }
+ratspeak-nomad = { path = "crates/ratspeak-nomad" }
 ratspeak-runtime = { path = "crates/ratspeak-runtime" }
 ratspeak-tauri = { path = "crates/ratspeak-tauri" }
 

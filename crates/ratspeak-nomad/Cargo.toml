@@ -1,0 +1,13 @@
+[package]
+name = "ratspeak-nomad"
+description = "NomadNet page/file fetching over an rsReticulum Link, plus a Micron-to-HTML converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nomad-core = { workspace = true }
+rns-identity = { workspace = true }
+rns-runtime = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

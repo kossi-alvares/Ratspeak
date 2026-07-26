@@ -40,6 +40,7 @@ serde_json = { workspace = true }
 # Internal crates
 ratspeak-core = { workspace = true }
 ratspeak-db = { workspace = true }
+ratspeak-nomad = { workspace = true }
 ratspeak-runtime = { workspace = true }
 rns-crypto = { workspace = true }
 rns-runtime = { workspace = true }

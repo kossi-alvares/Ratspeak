@@ -11,6 +11,7 @@ pub mod commands;
 pub mod config;
 pub mod emitter;
 pub mod error;
+pub mod nomad_browser;
 pub mod notifier;
 pub mod window_prefs;
 
