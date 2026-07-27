@@ -4546,5 +4546,27 @@ body.setup-active .main-content {
     flex: 1;
     min-width: 0;
     border: none;
-    background: #fff;
+    /* Remote pages mostly don't set a background, and the UA default is
+       white, which is jarring in a dark app. `color-scheme` moves the UA's
+       default canvas and text instead of painting over the page, so a page
+       that does specify its own colours -- native HTML with its own CSS, or
+       Micron via #!bg=/#!fg= -- still renders exactly as authored. Doing it
+       here rather than in an injected stylesheet is what lets it cover the
+       raw HTML pass-through too, which never goes through wrap_html. */
+    color-scheme: dark;
+    background: var(--surface-page, #14161a);
+}
+
+/* Shown only while a navigation is in flight; see _browserSetLoading. */
+.browser-loading {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--text-muted, #9aa0a6);
+}
+
+.browser-loading.is-active {
+    display: flex;
 }
