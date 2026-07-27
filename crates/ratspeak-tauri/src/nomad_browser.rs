@@ -67,7 +67,29 @@ fn parse_identity_hash(hex_str: &str) -> Result<[u8; 16], String> {
         .map_err(|_| "identity hash must be 16 bytes".to_string())
 }
 
+/// Page background for Micron output. Forced, not a fallback: Micron pages
+/// always render dark regardless of what the source asked for.
+const MICRON_PAGE_BG: &str = "#18171a";
+/// Default text colour, chosen to read on `MICRON_PAGE_BG`. Only a default —
+/// a page's own `#!fg=` and inline colour runs are inline styles and win.
+const MICRON_PAGE_FG: &str = "#f2eeea";
+
+/// Wraps rendered Micron in a document with the forced dark page background.
+///
+/// Only Micron goes through here; native HTML is passed through untouched and
+/// keeps rendering as authored.
+///
+/// The background is set with `!important` so it also beats the inline style
+/// on the page wrapper, which is what a `#!bg=` would otherwise reach. Text
+/// colour deliberately is not: it is a plain declaration, so `#!fg=` and the
+/// per-run colour spans still override it and keep pages readable.
 fn wrap_html(fragment: &str) -> Vec<u8> {
-    format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>{fragment}</body></html>")
-        .into_bytes()
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"color-scheme\" content=\"dark\">\
+         <style>html,body{{background:{MICRON_PAGE_BG}!important;margin:0;padding:12px}}\
+         body{{color:{MICRON_PAGE_FG}}}</style>\
+         </head><body>{fragment}</body></html>"
+    )
+    .into_bytes()
 }

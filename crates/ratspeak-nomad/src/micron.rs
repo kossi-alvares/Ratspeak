@@ -99,23 +99,18 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
         out.push_str(&render_table(&rows));
     }
 
-    match page_colors(&text) {
-        (None, None) => out,
-        (fg, bg) => {
-            let mut css = String::new();
-            if let Some(fg) = fg {
-                css.push_str(&format!("color:{fg};"));
-            }
-            if let Some(bg) = bg {
-                css.push_str(&format!("background-color:{bg};"));
-            }
-            // Fills the frame so the page colour isn't a band behind the text.
-            css.push_str("min-height:100%");
-            format!(
-                "<div class=\"mu-page\" style=\"{}\">{out}</div>\n",
-                html_escape(&css)
-            )
-        }
+    // `#!bg=` is still parsed, but deliberately not applied: Micron pages
+    // always render on the dark page background the host document forces, so
+    // an author-chosen page background is discarded here rather than fighting
+    // it downstream. `#!fg=` is applied — text colour is what makes real pages
+    // readable, and inline colour runs keep working regardless.
+    let (fg, _discarded_bg) = page_colors(&text);
+    match fg {
+        None => out,
+        Some(fg) => format!(
+            "<div class=\"mu-page\" style=\"{}\">{out}</div>\n",
+            html_escape(&format!("color:{fg}"))
+        ),
     }
 }
 
@@ -693,27 +688,57 @@ mod tests {
         assert!(!plain.contains("style=\"\""), "empty style emitted: {plain}");
     }
 
-    /// Matches Browser.py: a plain document-wide search, first hit wins, value
-    /// runs to the next newline and must be exactly 3 or 6 characters.
+    /// `#!fg=` is located the way Browser.py does it: a plain document-wide
+    /// search, first hit wins, value runs to the next newline and must be
+    /// exactly 3 or 6 characters.
     #[test]
-    fn page_colour_directives_follow_the_reference() {
-        let html = micron_to_html(b"#!fg=abc\n#!bg=112233\nHello\n");
+    fn page_foreground_directive_follows_the_reference() {
+        let html = micron_to_html(b"#!fg=abc\nHello\n");
         assert!(html.contains("color:#abc"), "{html}");
-        assert!(html.contains("background-color:#112233"), "{html}");
 
         // Not at the start of the document, and not at the start of a line.
-        let mid = micron_to_html(b">Title\ntext #!bg=fff\nmore\n");
-        assert!(mid.contains("background-color:#fff"), "{mid}");
+        let mid = micron_to_html(b">Title\ntext #!fg=fff\nmore\n");
+        assert!(mid.contains("color:#fff"), "{mid}");
 
         // Wrong length is rejected...
-        assert!(!micron_to_html(b"#!bg=ff\nx\n").contains("background-color"));
-        assert!(!micron_to_html(b"#!bg=fffff\nx\n").contains("background-color"));
+        assert!(!micron_to_html(b"#!fg=ff\nx\n").contains("mu-page"));
+        assert!(!micron_to_html(b"#!fg=fffff\nx\n").contains("mu-page"));
         // ...and so is a directive with no newline after it, as upstream's
         // newline search fails there.
-        assert!(!micron_to_html(b"#!bg=fff").contains("background-color"));
+        assert!(!micron_to_html(b"#!fg=fff").contains("mu-page"));
 
-        // No directive means no wrapper at all, so nothing to override.
+        // No directive means no wrapper at all.
         assert!(!micron_to_html(b"plain\n").contains("mu-page"));
+    }
+
+    /// Micron always renders on the host document's dark background, so an
+    /// author-chosen page background is parsed but discarded. Text colour is
+    /// unaffected.
+    #[test]
+    fn page_background_directive_is_parsed_but_never_applied() {
+        let html = micron_to_html(b"#!bg=fff\nHello\n");
+        assert!(
+            !html.contains("background-color"),
+            "page background must not be honoured: {html}"
+        );
+        assert!(!html.contains("mu-page"), "bg alone must not wrap: {html}");
+
+        // With both, only the foreground survives.
+        let both = micron_to_html(b"#!fg=abc\n#!bg=fff\nHello\n");
+        assert!(both.contains("color:#abc"), "{both}");
+        assert!(!both.contains("background-color"), "{both}");
+
+        // It is still parsed, so the directive line never leaks as text.
+        assert!(!both.contains("#!bg"), "directive leaked into output: {both}");
+    }
+
+    /// Inline `` `B `` background runs are per-run spans, not the page
+    /// background, and must keep working.
+    #[test]
+    fn inline_background_runs_survive_the_forced_page_background() {
+        let html = micron_to_html(b"`B8F0`F000text");
+        assert!(html.contains("background-color:#88FF00"), "{html}");
+        assert!(html.contains("color:#000000"), "{html}");
     }
 
     /// Upstream does not validate hex, so neither do we -- but the value must
@@ -722,7 +747,7 @@ mod tests {
     fn page_colour_is_not_hex_validated_but_stays_contained() {
         // Exactly three characters, so it passes the length gate the way a
         // real colour would, but is not hex and contains attribute syntax.
-        let html = micron_to_html(b"#!bg=\"><\nx\n");
+        let html = micron_to_html(b"#!fg=\"><\nx\n");
         assert!(html.contains("mu-page"), "length-valid value was rejected: {html}");
         assert!(html.contains("&quot;"), "value was not escaped: {html}");
         assert!(!html.contains("style=\"\">"), "broke out of the attribute: {html}");
