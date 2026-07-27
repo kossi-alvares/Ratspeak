@@ -990,6 +990,9 @@
                     <input class="nr-input" id="browser-address-input" type="text" placeholder="nomad://&lt;identity-hash&gt;/page/index.mu" autocomplete="off" spellcheck="false">
                     <button class="nr-btn nr-btn-primary" type="submit">Go</button>
                 </form>
+                <div class="browser-loading" id="browser-loading" role="status" aria-live="polite">
+                    <span class="loading-spinner"></span><span id="browser-loading-text">Loading…</span>
+                </div>
                 <div class="panel-body browser-body">
                     <div class="browser-nodes" id="browser-nodes">
                         <input class="nr-input-sm browser-nodes-search" id="browser-nodes-search" type="text" placeholder="Filter pages" autocomplete="off">

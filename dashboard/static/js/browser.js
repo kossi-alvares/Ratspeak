@@ -58,12 +58,21 @@ function _browserHistoryPush(url) {
 // the frame first tears that load down, so a new navigation always starts
 // immediately instead of queueing behind a dead one. The old request may
 // still run to completion in the background, but nothing waits on it.
+/// Shows or hides the in-flight indicator.
+function _browserSetLoading(on) {
+    var el = document.getElementById('browser-loading');
+    if (el) el.classList.toggle('is-active', !!on);
+}
+
 function _browserLoadIntoFrame(url) {
     var frame = document.getElementById('browser-frame');
     var input = document.getElementById('browser-address-input');
     if (frame) {
         if (frame.getAttribute('src')) frame.src = 'about:blank';
         frame.src = url;
+        // Same moment the previous load is abandoned, so the indicator tracks
+        // exactly the request the frame is actually waiting on.
+        _browserSetLoading(true);
     }
     if (input) input.value = url;
 }
@@ -188,6 +197,18 @@ document.addEventListener('DOMContentLoaded', function() {
             _browserHistoryPush(e.data.href);
         }
     });
+
+    // A nomad:// fetch is bounded by the Rust side's request timeout, so the
+    // frame fires load either way -- page or error page -- and the indicator
+    // clears on both. Blanking the frame to abandon a stale load fires a load
+    // of its own, which must not be mistaken for the new one arriving.
+    var loadFrame = document.getElementById('browser-frame');
+    if (loadFrame) {
+        loadFrame.addEventListener('load', function() {
+            if ((loadFrame.getAttribute('src') || '') === 'about:blank') return;
+            _browserSetLoading(false);
+        });
+    }
 
     var backBtn = document.getElementById('browser-back');
     if (backBtn) backBtn.addEventListener('click', function() { _browserGo(-1); });
