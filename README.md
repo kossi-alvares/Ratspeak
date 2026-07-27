@@ -54,6 +54,8 @@ released. iOS does not have a public download yet; and macOS is unsigned, with W
   status, and transport health in the app.
 - Experimental peer-to-peer voice calls over [LXST](https://github.com/ratspeak/rsLXST)
   (contacts-only, 0-hop, native microphone/speaker).
+- A NomadNet browser: Micron (`.mu`) and plain HTML pages served by nodes on
+  the mesh, with a discovered-nodes list, address bar, and back/forward.
 - Chess and Tic-Tac-Toe.
 - I'm tired boss, this whole README is going to get a revamp.
 
@@ -75,22 +77,28 @@ The full build guide is here:
 It covers desktop prerequisites, Android APKs, iOS signing, and the required
 sibling checkout layout.
 
-After installing the desktop prerequisites, the shortest local path is:
+This fork tracks work that is not upstream yet, so the sibling checkouts have
+to match it — the upstream branches will not build this tree. After installing
+the desktop prerequisites:
 
 ```bash
 mkdir ratspeak-src
 cd ratspeak-src
-git clone https://github.com/ratspeak/rsReticulum
-git clone https://github.com/ratspeak/rsLXMF
+git clone -b feature/session-fixes https://github.com/kossi-alvares/rsReticulum
+git clone -b dev                    https://github.com/kossi-alvares/rsLXMF
 git clone https://github.com/ratspeak/lrgp-rs
 git clone https://github.com/ratspeak/rsLXST   # experimental voice; skip with --no-default-features
-git clone https://github.com/ratspeak/Ratspeak
+git clone -b feature/nomad-browser  https://github.com/kossi-alvares/Ratspeak
 
 cd Ratspeak
 bash dashboard/build-css.sh
 cd src-tauri
 cargo tauri dev
 ```
+
+`rsLXMF` is `dev`, not `main`: the fork's `main` still carries the older
+`lxmf-core` API and will not compile against this tree. `lrgp-rs` and `rsLXST`
+have no fork and are taken from upstream unchanged.
 
 For a release bundle, run `cargo tauri build` from `Ratspeak/src-tauri`.
 Desktop bundles land under `Ratspeak/src-tauri/target/release/bundle/`.
@@ -125,6 +133,44 @@ ringtones, and platform audio routing are all subject to change.
 - Linux Bluetooth Peer depends on BlueZ GATT server and LE advertising support.
 - Voice calls require microphone permission per platform; the prompt is
   triggered the first time you place or answer a call.
+
+## Credits / Acknowledgements
+
+The Nomad Network browser in this fork was built against other people's work. No code was
+copied from any of the projects below — where behaviour matches a reference implementation,
+it was re-derived from that implementation's source and verified against it.
+
+**Protocols and reference implementations**
+
+- **Mark Qvist** ([markqvist](https://github.com/markqvist)) — creator of
+  [Reticulum](https://github.com/markqvist/Reticulum) and
+  [NomadNet](https://github.com/markqvist/NomadNet), the protocol and reference client this
+  feature exists to interoperate with. NomadNet's `MicronParser.py` is the normative reference
+  for the Micron renderer here: its grammar was differential-tested against ours and five
+  divergences were fixed to match it. `Browser.py` defined the URL and page-header semantics,
+  and `format_table_raw` (from Reticulum's `rngit`) the table-layout rules.
+- **kc1awv** — author of the [Reticulum Relay Chat](https://rrc.kc1awv.net/) protocol
+  specification, referenced for the queued RRC integration.
+
+**Consulted for correctness**
+
+- **liamcottle** ([reticulum-meshchat](https://github.com/liamcottle/reticulum-meshchat)) —
+  referenced for the discovered-nodes UX and for the default node page path convention.
+- **RFnexus** ([micron-parser-js](https://github.com/RFnexus/micron-parser-js)) — a second
+  independent Micron implementation, used as a grammar and sanitisation cross-check while
+  auditing and fixing the parser.
+
+**Projects this builds on**
+
+- **DeFiDude** ([ratspeak](https://github.com/ratspeak)) — author of Ratspeak itself, which
+  this fork extends, along with the `rsReticulum`, `rsLXMF`, and `rsLXST` crates it depends on.
+- **Oleg Belousov** ([strijar](https://github.com/strijar), publishing as
+  [reticulum-spb](https://github.com/reticulum-spb)) — author of
+  [rsNodePage](https://github.com/reticulum-spb/rsNodePage), whose `nomad-core` served every
+  page used to develop and test this feature, and a substantial contributor to `rsReticulum`
+  and `rsLXMF`. Also author of `rsNomadNet`, consulted as an architectural reference for the
+  queued Micron form support, and of `rsRRC` / `rsRRC-client` / `rsRRCD`, noted for future RRC
+  work. Nothing from these was ported.
 
 ## License
 
