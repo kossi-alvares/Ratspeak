@@ -87,9 +87,40 @@ fn wrap_html(fragment: &str) -> Vec<u8> {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
          <meta name=\"color-scheme\" content=\"dark\">\
-         <style>html,body{{background:{MICRON_PAGE_BG}!important;margin:0;padding:12px}}\
-         body{{color:{MICRON_PAGE_FG}}}</style>\
+         <style>\
+         html,body{{background:{MICRON_PAGE_BG}!important;margin:0;padding:12px}}\
+         body{{color:{MICRON_PAGE_FG};{MICRON_GRID_CSS}}}\
+         p,h1,h2,h3,h4,h5,h6,pre,.mu-divider{{margin:0;font-size:inherit;{MICRON_ROW_CSS}}}\
+         </style>\
          </head><body>{fragment}</body></html>"
     )
     .into_bytes()
 }
+
+/// Micron is a terminal format: NomadNet renders every line as one row of a
+/// fixed character grid, so lines sit flush and spacing comes from the blank
+/// lines the author wrote, not from margins.
+///
+/// Reproducing that grid is what makes multi-line ASCII banners hold together:
+///
+/// * `monospace` — block-drawing characters only tile if every cell is the
+///   same width, and column alignment depends on it.
+/// * `line-height:1` — a full-block glyph fills its em box, so anything above
+///   1 leaves a horizontal seam between rows of a banner.
+/// * `white-space:pre-wrap` — leading and interior runs of spaces carry the
+///   shape of the art, and the default collapsing rules destroy them. `pre-wrap`
+///   rather than `pre` because the reference wraps at the terminal width too,
+///   and it avoids forcing horizontal scroll on ordinary prose.
+///
+/// Margins are zeroed (and heading sizes normalised to the grid) for the same
+/// reason: a margin applies between every pair of lines, including the ones
+/// inside a banner.
+const MICRON_GRID_CSS: &str = "font-family:ui-monospace,\"DejaVu Sans Mono\",\"Liberation Mono\",Menlo,Consolas,monospace;\
+     line-height:1";
+
+/// Applied to the elements that hold a row's text, never to `body`.
+///
+/// `white-space` must not be inherited by the container: the fragment carries
+/// a newline between each `</p>` and the next `<p>`, and preserving those
+/// turns every gap between rows into a rendered blank line.
+const MICRON_ROW_CSS: &str = "white-space:pre-wrap";

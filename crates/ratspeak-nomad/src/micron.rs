@@ -11,9 +11,10 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
     let mut literal = false;
     let mut table: Option<Vec<String>> = None;
 
-    for raw_line in text.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-
+    // `lines()` rather than `split('\n')`: the trailing newline nearly every
+    // page ends with would otherwise yield one extra empty segment, and that
+    // now renders as a stray blank row.
+    for line in text.lines() {
         if line == "`=" {
             if literal {
                 out.push_str("</pre>\n");
@@ -87,7 +88,13 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
             continue;
         }
 
+        // A blank source line is a blank row, exactly as it is in the
+        // reference renderer's fixed grid. Dropping it and letting CSS
+        // margins stand in for spacing is what tore multi-line ASCII art
+        // apart, since a margin applies between *every* pair of lines. The
+        // space keeps the line box from collapsing to zero height.
         if line.trim().is_empty() {
+            out.push_str("<p> </p>\n");
             continue;
         }
 
@@ -753,6 +760,41 @@ mod tests {
         assert!(!html.contains("style=\"\">"), "broke out of the attribute: {html}");
     }
 
+    /// Multi-line ASCII banners must come out as consecutive rows with no
+    /// filler between them, and with their spacing intact -- the shape of the
+    /// art is carried by runs of spaces.
+    #[test]
+    fn consecutive_art_lines_stay_adjacent_and_keep_their_spacing() {
+        let art = "   \u{2588}\u{2588}\u{2588}   x\n\u{2588}  \u{2588}\u{2588}\u{2588}\n";
+        let html = micron_to_html(art.as_bytes());
+
+        // One row per source line, nothing injected between them.
+        assert_eq!(
+            html,
+            "<p>   \u{2588}\u{2588}\u{2588}   x</p>\n<p>\u{2588}  \u{2588}\u{2588}\u{2588}</p>\n",
+            "got: {html}"
+        );
+        // Leading and interior space runs survive verbatim.
+        assert!(html.contains("<p>   \u{2588}"), "leading spaces lost: {html}");
+        assert!(html.contains("\u{2588}   x"), "interior spaces lost: {html}");
+    }
+
+    /// Spacing comes from the author's blank lines, the way it does on the
+    /// reference's fixed grid -- not from margins, which would also land
+    /// between the rows of a banner.
+    #[test]
+    fn blank_source_lines_become_blank_rows() {
+        assert_eq!(micron_to_html(b"a\n\nb\n"), "<p>a</p>\n<p> </p>\n<p>b</p>\n");
+        // A trailing newline terminates the last line rather than adding one.
+        assert_eq!(micron_to_html(b"a\n"), "<p>a</p>\n");
+        assert_eq!(micron_to_html(b"a"), "<p>a</p>\n");
+        // Two blank lines are two rows.
+        assert_eq!(
+            micron_to_html(b"a\n\n\nb\n"),
+            "<p>a</p>\n<p> </p>\n<p> </p>\n<p>b</p>\n"
+        );
+    }
+
     #[test]
     fn renders_link() {
         assert_eq!(
@@ -957,7 +999,7 @@ mod tests {
         let html = micron_to_html(mu);
         assert_eq!(
             html,
-            "<h1>Pages</h1>\n<p>No pages have been published yet.</p>\n"
+            "<h1>Pages</h1>\n<p> </p>\n<p>No pages have been published yet.</p>\n"
         );
     }
 
@@ -967,7 +1009,7 @@ mod tests {
         let html = micron_to_html(mu);
         assert_eq!(
             html,
-            "<h1>Pages</h1>\n\
+            "<h1>Pages</h1>\n<p> </p>\n\
              <p><a href=\"/page/index.mu\">index.mu</a></p>\n\
              <p><a href=\"/page/about.mu\">about.mu</a></p>\n"
         );
