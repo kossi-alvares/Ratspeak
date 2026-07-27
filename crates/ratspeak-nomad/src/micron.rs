@@ -99,7 +99,52 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
         out.push_str(&render_table(&rows));
     }
 
-    out
+    match page_colors(&text) {
+        (None, None) => out,
+        (fg, bg) => {
+            let mut css = String::new();
+            if let Some(fg) = fg {
+                css.push_str(&format!("color:{fg};"));
+            }
+            if let Some(bg) = bg {
+                css.push_str(&format!("background-color:{bg};"));
+            }
+            // Fills the frame so the page colour isn't a band behind the text.
+            css.push_str("min-height:100%");
+            format!(
+                "<div class=\"mu-page\" style=\"{}\">{out}</div>\n",
+                html_escape(&css)
+            )
+        }
+    }
+}
+
+/// Page-level `#!fg=`/`#!bg=` colours, as `(foreground, background)`.
+///
+/// Per NomadNet's `Browser.py`, these are located with a plain search over the
+/// whole document rather than per line, so the directive counts anywhere it
+/// appears; only the first of each is used. The value runs to the next newline
+/// and is taken only when that span is exactly 3 or 6 characters — which also
+/// means a directive on a final line with no trailing newline is ignored,
+/// since the search for the newline fails.
+///
+/// Upstream does not check the value is hex, and neither do we, so a page that
+/// renders there renders here. The value is emitted as a CSS colour and
+/// escaped; anything that isn't valid hex simply makes the declaration invalid
+/// and the browser drops it, which is the closest safe analogue to a terminal
+/// ignoring an unusable colour.
+fn page_colors(text: &str) -> (Option<String>, Option<String>) {
+    fn find_directive(text: &str, tag: &str) -> Option<String> {
+        let at = text.find(tag)? + tag.len();
+        let end = at + text[at..].find('\n')?;
+        let value = &text[at..end];
+        (value.chars().count() == 3 || value.chars().count() == 6)
+            .then(|| format!("#{value}"))
+    }
+    (
+        find_directive(text, "#!fg="),
+        find_directive(text, "#!bg="),
+    )
 }
 
 /// Number of divider characters drawn for a `-X` rule, matching the reference
@@ -646,6 +691,41 @@ mod tests {
         // An unstyled link must stay unstyled -- no empty style attribute.
         let plain = micron_to_html(b"`[Plain`:/p.mu]");
         assert!(!plain.contains("style=\"\""), "empty style emitted: {plain}");
+    }
+
+    /// Matches Browser.py: a plain document-wide search, first hit wins, value
+    /// runs to the next newline and must be exactly 3 or 6 characters.
+    #[test]
+    fn page_colour_directives_follow_the_reference() {
+        let html = micron_to_html(b"#!fg=abc\n#!bg=112233\nHello\n");
+        assert!(html.contains("color:#abc"), "{html}");
+        assert!(html.contains("background-color:#112233"), "{html}");
+
+        // Not at the start of the document, and not at the start of a line.
+        let mid = micron_to_html(b">Title\ntext #!bg=fff\nmore\n");
+        assert!(mid.contains("background-color:#fff"), "{mid}");
+
+        // Wrong length is rejected...
+        assert!(!micron_to_html(b"#!bg=ff\nx\n").contains("background-color"));
+        assert!(!micron_to_html(b"#!bg=fffff\nx\n").contains("background-color"));
+        // ...and so is a directive with no newline after it, as upstream's
+        // newline search fails there.
+        assert!(!micron_to_html(b"#!bg=fff").contains("background-color"));
+
+        // No directive means no wrapper at all, so nothing to override.
+        assert!(!micron_to_html(b"plain\n").contains("mu-page"));
+    }
+
+    /// Upstream does not validate hex, so neither do we -- but the value must
+    /// not be able to break out of the style attribute.
+    #[test]
+    fn page_colour_is_not_hex_validated_but_stays_contained() {
+        // Exactly three characters, so it passes the length gate the way a
+        // real colour would, but is not hex and contains attribute syntax.
+        let html = micron_to_html(b"#!bg=\"><\nx\n");
+        assert!(html.contains("mu-page"), "length-valid value was rejected: {html}");
+        assert!(html.contains("&quot;"), "value was not escaped: {html}");
+        assert!(!html.contains("style=\"\">"), "broke out of the attribute: {html}");
     }
 
     #[test]
