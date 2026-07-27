@@ -285,8 +285,17 @@ fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) 
                         Some(url) => (first, url),
                         None => (first, first),
                     };
+                    // A link sits inside the run of formatting it was opened
+                    // in, so it carries that run's style. Emitting it bare
+                    // dropped the weight and colour the page asked for, and
+                    // left the colour to reappear on whatever followed.
+                    let css = state.css();
                     out.push_str("<a href=\"");
                     out.push_str(&html_escape(&sanitize_url(url)));
+                    if !css.is_empty() {
+                        out.push_str("\" style=\"");
+                        out.push_str(&html_escape(&css));
+                    }
                     out.push_str("\">");
                     out.push_str(&html_escape(label));
                     out.push_str("</a>");
@@ -620,6 +629,23 @@ mod tests {
     fn leading_angle_bracket_consumed_as_depth_reset() {
         // Was: `<p>&lt;reset depth</p>` — stray `<` shown to the user.
         assert_eq!(micron_to_html(b"<reset depth"), "<p>reset depth</p>\n");
+    }
+
+    /// Real pages colour their links; emitting the anchor without the active
+    /// run's style dropped that styling and let the colour reappear on the
+    /// text after the link instead.
+    #[test]
+    fn link_inherits_the_formatting_run_it_sits_in() {
+        let html = micron_to_html(b"`!`F00F`[Styled`:/p.mu]`! after");
+        assert!(
+            html.contains("font-weight:bold") && html.contains("color:#0000FF"),
+            "link lost its run styling: {html}"
+        );
+        let anchor = &html[html.find("<a ").unwrap()..html.find("</a>").unwrap()];
+        assert!(anchor.contains("style="), "anchor carried no style: {anchor}");
+        // An unstyled link must stay unstyled -- no empty style attribute.
+        let plain = micron_to_html(b"`[Plain`:/p.mu]");
+        assert!(!plain.contains("style=\"\""), "empty style emitted: {plain}");
     }
 
     #[test]
