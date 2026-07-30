@@ -83,6 +83,31 @@ function _browserNavigate(url) {
     _browserHistoryPush(url);
 }
 
+// A file link inside the frame (see NOMAD_ADDRESS_SYNC_SCRIPT in src-tauri)
+// posts 'nomad-download' instead of navigating. Fetches the bytes over IPC
+// and hands them to the same blob-download path LXMF attachments use
+// (RS.saveDownloadedFile), which is what actually reaches a save dialog /
+// mobile share sheet — the nomad:// scheme's own responses never do.
+function _browserDownloadFile(url) {
+    _browserSetLoading(true);
+    RS.invoke('api_nomad_file_download', { url: url }).then(function(result) {
+        var raw = atob(result.data_base64);
+        var arr = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        var blob = new Blob([arr], { type: result.mime || 'application/octet-stream' });
+        return RS.saveDownloadedFile({
+            url: URL.createObjectURL(blob),
+            filename: result.filename || 'download',
+            mime: result.mime || 'application/octet-stream'
+        });
+    }).then(function() {
+        _browserSetLoading(false);
+    }).catch(function(err) {
+        _browserSetLoading(false);
+        showToast('Download failed: ' + ((err && err.message) || 'unknown error'), 'toast-red', 4000);
+    });
+}
+
 /// Moves `delta` entries through history without pushing a new one.
 ///
 /// The loaded page reports its own href back over postMessage, which would
@@ -183,9 +208,16 @@ document.addEventListener('DOMContentLoaded', function() {
     // so in-page link clicks report their own location back via postMessage
     // instead — keeps the address bar in sync with where the iframe actually is.
     window.addEventListener('message', function(e) {
-        if (!e.data || e.data.type !== 'nomad-nav') return;
+        if (!e.data) return;
         var frame = document.getElementById('browser-frame');
         if (e.source !== (frame && frame.contentWindow)) return;
+
+        if (e.data.type === 'nomad-download') {
+            _browserDownloadFile(e.data.href);
+            return;
+        }
+        if (e.data.type !== 'nomad-nav') return;
+
         var input = document.getElementById('browser-address-input');
         if (input) input.value = e.data.href;
         // In-page link clicks navigate the frame directly, so this report is

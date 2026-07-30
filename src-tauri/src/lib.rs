@@ -665,6 +665,7 @@ pub fn run() {
             ratspeak_tauri::commands::network::api_propagation,
             ratspeak_tauri::commands::network::api_propagation_nodes,
             ratspeak_tauri::commands::network::api_nomad_nodes,
+            ratspeak_tauri::commands::network::api_nomad_file_download,
             ratspeak_tauri::commands::network::api_hub_interfaces,
             ratspeak_tauri::commands::messaging::api_conversation,
             ratspeak_tauri::commands::messaging::api_lxmf_conversations,
@@ -895,11 +896,33 @@ pub fn run() {
             // can't read iframe.contentWindow.location cross-origin to keep the address
             // bar in sync with in-page link clicks. Have each nomad:// document report
             // its own href back via postMessage instead.
+            //
+            // Also intercepts clicks on file links (same extension rule as
+            // `ratspeak_nomad::fetch::classify`: anything but .mu/.html/.htm is a
+            // file) so they download instead of navigating the frame to raw bytes —
+            // the nomad:// scheme is a custom URI scheme handler, which never
+            // reaches the webview's real download machinery, so this has to be
+            // done by hand. Runs despite `script-src 'none'`: this is injected as a
+            // WebKit user script, not page content, so the frame's own CSP doesn't
+            // apply to it.
             const NOMAD_ADDRESS_SYNC_SCRIPT: &str = r#"
                 if (location.protocol === 'nomad:') {
                     window.addEventListener('DOMContentLoaded', function () {
                         window.parent.postMessage({ type: 'nomad-nav', href: location.href }, '*');
                     });
+                    document.addEventListener('click', function (e) {
+                        var a = e.target && e.target.closest && e.target.closest('a[href]');
+                        if (!a) return;
+                        var href = a.href;
+                        if (!href || href.indexOf('nomad:') !== 0) return;
+                        var path;
+                        try { path = new URL(href).pathname; } catch (err) { return; }
+                        var dot = path.lastIndexOf('.');
+                        var ext = dot === -1 ? '' : path.slice(dot + 1).toLowerCase();
+                        if (ext === 'html' || ext === 'htm' || ext === 'mu') return;
+                        e.preventDefault();
+                        window.parent.postMessage({ type: 'nomad-download', href: href }, '*');
+                    }, true);
                 }
             "#;
 

@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::State;
 
@@ -193,6 +195,51 @@ pub async fn api_nomad_nodes(state: State<'_, Arc<AppState>>) -> AppResult<Value
         })
         .unwrap_or_default();
     Ok(json!(nodes))
+}
+
+#[derive(Serialize)]
+pub struct NomadFileDownload {
+    pub mime: String,
+    pub filename: String,
+    /// Base64 (Tauri JSON IPC encodes Vec<u8> as number array; 6× the wire).
+    pub data_base64: String,
+}
+
+/// Fetches a `nomad://<identity-hash>/file/<name>` link for the Browser panel.
+///
+/// The `nomad://` scheme is served by a WebKitGTK custom URI scheme handler
+/// (`register_uri_scheme` in src-tauri), which bypasses the webview's real
+/// network/download stack entirely — `Content-Disposition: attachment` on
+/// that response never reaches WebKit's download-started signal. So this
+/// fetches the bytes itself and hands them to the same base64-to-blob path
+/// already used for LXMF attachments (`RS.fileDownload`/`saveDownloadedFile`),
+/// which does reach a real download (native save dialog, Android/iOS share).
+#[tauri::command]
+pub async fn api_nomad_file_download(
+    state: State<'_, Arc<AppState>>,
+    url: String,
+) -> AppResult<NomadFileDownload> {
+    let uri: tauri::http::Uri = url
+        .parse()
+        .map_err(|_| AppError::bad_request("Invalid nomad:// URL"))?;
+    if uri.scheme_str() != Some("nomad") {
+        return Err(AppError::bad_request("Not a nomad:// URL"));
+    }
+    let host = uri.host().unwrap_or("").to_string();
+    let path = uri.path().to_string();
+
+    let resp = crate::nomad_browser::fetch_for_uri(&state, &host, &path)
+        .await
+        .map_err(AppError::service_unavailable)?;
+    let filename = resp.attachment_name.unwrap_or_else(|| "download".to_string());
+    let mime = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .to_string();
+    Ok(NomadFileDownload {
+        mime,
+        filename,
+        data_base64: B64.encode(&resp.body),
+    })
 }
 
 /// 10s throttle. Returns `{ kind: "throttled" | "offline" | "sent", count? }`.
