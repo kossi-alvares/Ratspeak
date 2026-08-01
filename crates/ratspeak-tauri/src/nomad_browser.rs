@@ -20,6 +20,47 @@ pub async fn fetch_for_uri(
     identity_hash_hex: &str,
     path: &str,
 ) -> Result<NomadResponse, String> {
+    let (handle, identity, identity_hash) = resolve_fetch_args(state, identity_hash_hex)?;
+    let content = ratspeak_nomad::fetch(&handle, &identity, identity_hash, path, FETCH_TIMEOUT)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(to_response(content))
+}
+
+/// Same as [`fetch_for_uri`], but sends `(bytes_received, total_bytes)` on
+/// `progress` as the file's resource segments arrive — see
+/// `ratspeak_nomad::fetch_with_progress`.
+pub async fn fetch_for_uri_with_progress(
+    state: &AppState,
+    identity_hash_hex: &str,
+    path: &str,
+    progress: tokio::sync::mpsc::UnboundedSender<(usize, usize)>,
+) -> Result<NomadResponse, String> {
+    let (handle, identity, identity_hash) = resolve_fetch_args(state, identity_hash_hex)?;
+    let content = ratspeak_nomad::fetch_with_progress(
+        &handle,
+        &identity,
+        identity_hash,
+        path,
+        FETCH_TIMEOUT,
+        progress,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(to_response(content))
+}
+
+fn resolve_fetch_args(
+    state: &AppState,
+    identity_hash_hex: &str,
+) -> Result<
+    (
+        rns_runtime::reticulum::ReticulumHandle,
+        rns_identity::identity::Identity,
+        [u8; 16],
+    ),
+    String,
+> {
     let identity_hash = parse_identity_hash(identity_hash_hex)?;
 
     let handle = state
@@ -37,11 +78,11 @@ pub async fn fetch_for_uri(
         .map(|mgr| mgr.identity.clone())
         .ok_or_else(|| "no identity is unlocked".to_string())?;
 
-    let content = ratspeak_nomad::fetch(&handle, &identity, identity_hash, path, FETCH_TIMEOUT)
-        .await
-        .map_err(|e| e.to_string())?;
+    Ok((handle, identity, identity_hash))
+}
 
-    Ok(match content {
+fn to_response(content: FetchedContent) -> NomadResponse {
+    match content {
         FetchedContent::Html(bytes) => NomadResponse {
             content_type: "text/html; charset=utf-8",
             body: bytes,
@@ -57,7 +98,7 @@ pub async fn fetch_for_uri(
             body: bytes,
             attachment_name: Some(name),
         },
-    })
+    }
 }
 
 fn parse_identity_hash(hex_str: &str) -> Result<[u8; 16], String> {

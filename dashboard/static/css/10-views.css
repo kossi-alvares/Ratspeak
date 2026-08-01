@@ -4557,7 +4557,9 @@ body.setup-active .main-content {
     background: var(--surface-page, #14161a);
 }
 
-/* Shown only while a navigation is in flight; see _browserSetLoading. */
+/* Shared style for the nav (#browser-loading, see _browserSetLoading) and
+   download (#browser-download-loading, see _browserSetDownloading) indicators
+   — separate elements so the two operations don't clobber each other's state. */
 .browser-loading {
     display: none;
     align-items: center;

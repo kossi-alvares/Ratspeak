@@ -64,6 +64,33 @@ function _browserSetLoading(on) {
     if (el) el.classList.toggle('is-active', !!on);
 }
 
+/// Shows or hides the download-in-flight indicator. Separate element from
+/// _browserSetLoading (navigation) so starting one doesn't hide the other —
+/// a file link click and a page load can be in flight at the same time.
+function _browserSetDownloading(on) {
+    var el = document.getElementById('browser-download-loading');
+    if (el) el.classList.toggle('is-active', !!on);
+    if (on) _browserSetDownloadProgressText('Downloading…');
+}
+
+function _browserSetDownloadProgressText(text) {
+    var el = document.getElementById('browser-download-loading-text');
+    if (el) el.textContent = text;
+}
+
+// 'nomad_download_progress' (see api_nomad_file_download) fires for the file
+// download currently in flight -- the panel only ever runs one at a time, so
+// there's no id to key off. total_bytes is 0 until the reply's resource
+// advertisement arrives; small/inline files never advertise one at all, so
+// this may never fire for them (they finish before a listener would matter).
+RS.listen('nomad_download_progress', function(data) {
+    if (!data || !data.total_bytes) return;
+    var percent = Math.min(99, Math.max(1, Math.round((data.bytes_received / data.total_bytes) * 100)));
+    _browserSetDownloadProgressText(
+        'Downloading… ' + percent + '% (' + prettySize(data.bytes_received) + ' of ' + prettySize(data.total_bytes) + ')'
+    );
+});
+
 function _browserLoadIntoFrame(url) {
     var frame = document.getElementById('browser-frame');
     var input = document.getElementById('browser-address-input');
@@ -89,7 +116,7 @@ function _browserNavigate(url) {
 // (RS.saveDownloadedFile), which is what actually reaches a save dialog /
 // mobile share sheet — the nomad:// scheme's own responses never do.
 function _browserDownloadFile(url) {
-    _browserSetLoading(true);
+    _browserSetDownloading(true);
     RS.invoke('api_nomad_file_download', { url: url }).then(function(result) {
         var raw = atob(result.data_base64);
         var arr = new Uint8Array(raw.length);
@@ -101,9 +128,10 @@ function _browserDownloadFile(url) {
             mime: result.mime || 'application/octet-stream'
         });
     }).then(function() {
-        _browserSetLoading(false);
+        _browserSetDownloading(false);
+        showToast('Saved', 'toast-green', 2200);
     }).catch(function(err) {
-        _browserSetLoading(false);
+        _browserSetDownloading(false);
         showToast('Download failed: ' + ((err && err.message) || 'unknown error'), 'toast-red', 4000);
     });
 }

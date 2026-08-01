@@ -41,6 +41,32 @@ pub async fn fetch(
     Ok(classify(path, bytes))
 }
 
+/// Same as [`fetch`], but sends `(bytes_received, total_bytes)` on `progress`
+/// as the reply's resource segments arrive. See
+/// `LinkClient::query_with_progress` for when `progress` does and doesn't fire.
+pub async fn fetch_with_progress(
+    handle: &ReticulumHandle,
+    identity: &Identity,
+    target_identity_hash: [u8; 16],
+    path: &str,
+    timeout: Duration,
+    progress: tokio::sync::mpsc::UnboundedSender<(usize, usize)>,
+) -> Result<FetchedContent, NomadFetchError> {
+    let link_client = LinkClient::new(handle.transport_tx.clone(), identity.clone());
+    let bytes = link_client
+        .query_with_progress(
+            target_identity_hash,
+            nomad_core::announce::APP_NAME,
+            path,
+            Vec::new(),
+            1,
+            timeout,
+            progress,
+        )
+        .await?;
+    Ok(classify(path, bytes))
+}
+
 fn classify(path: &str, bytes: Vec<u8>) -> FetchedContent {
     let ext = path
         .rsplit_once('.')

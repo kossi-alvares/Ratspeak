@@ -228,9 +228,25 @@ pub async fn api_nomad_file_download(
     let host = uri.host().unwrap_or("").to_string();
     let path = uri.path().to_string();
 
-    let resp = crate::nomad_browser::fetch_for_uri(&state, &host, &path)
-        .await
-        .map_err(AppError::service_unavailable)?;
+    // Forwards to a "nomad_download_progress" event (bytes_received/total_bytes,
+    // same shape as lxmf_delivery_progress) so the Browser panel can show a real
+    // percent/KB-of-MB indicator instead of a bare spinner. The channel closes
+    // itself when fetch_for_uri_with_progress returns, ending this task.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit_state = state.inner().clone();
+    tokio::spawn(async move {
+        while let Some((bytes_received, total_bytes)) = progress_rx.recv().await {
+            emit_state.emit_to_all(
+                "nomad_download_progress",
+                json!({ "bytes_received": bytes_received, "total_bytes": total_bytes }),
+            );
+        }
+    });
+
+    let resp =
+        crate::nomad_browser::fetch_for_uri_with_progress(&state, &host, &path, progress_tx)
+            .await
+            .map_err(AppError::service_unavailable)?;
     let filename = resp.attachment_name.unwrap_or_else(|| "download".to_string());
     let mime = mime_guess::from_path(&filename)
         .first_or_octet_stream()
