@@ -963,21 +963,20 @@ pub fn run() {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let window = window.on_download(|_webview, event| {
                 match event {
-                    DownloadEvent::Requested { url, destination } => {
-                        let filename = url
-                            .path_segments()
-                            .and_then(|mut s| s.next_back())
-                            .unwrap_or("download")
-                            .to_string();
-
-                        // Strip "1693824532000_doc.pdf" → "doc.pdf".
-                        let clean_name = filename
-                            .find('_')
-                            .map(|pos| &filename[pos + 1..])
-                            .unwrap_or(&filename);
+                    DownloadEvent::Requested { destination, .. } => {
+                        // `destination` already holds the webview's own suggested path
+                        // (download dir + the name from the triggering `<a download>`
+                        // attribute or Content-Disposition) — the *blob:* URL a download
+                        // like this actually uses carries no filename at all, only an
+                        // opaque id, so parsing it here (as this used to do) produced
+                        // "download" or the raw id instead of the real name.
+                        let suggested_name = destination
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "download".to_string());
 
                         if let Some(path) =
-                            rfd::FileDialog::new().set_file_name(clean_name).save_file()
+                            rfd::FileDialog::new().set_file_name(suggested_name).save_file()
                         {
                             *destination = path;
                             true
