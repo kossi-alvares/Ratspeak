@@ -4,12 +4,82 @@
 //! syntax, backtick-toggled bold/italic/underline/color spans, and
 //! `` `t ``-delimited tables. Forms, anchors and partials (NomadNet-specific,
 //! not needed for read-only browsing) are not implemented.
+//!
+//! `parse_micron` walks the grammar once into a `Vec<MicronLine>`; `render_html`
+//! (used by `micron_to_html`) is the only current consumer, but the AST is
+//! public so other crates can visit it without re-parsing (a plain-text +
+//! link extractor, for instance, without duplicating this grammar).
 
-pub fn micron_to_html(bytes: &[u8]) -> String {
+/// One parsed line of a Micron document, in source order.
+pub enum MicronLine {
+    /// One raw line inside a `` `= `` literal block, in source order.
+    Literal(String),
+    /// The closing `` `= `` of a literal block. Absent if the block runs to
+    /// end of document unclosed -- `render_html` never emits a closing
+    /// `</pre>` in that case, matching upstream, so this is a real event, not
+    /// decoration.
+    LiteralEnd,
+    /// A `#`-prefixed comment line, kept intact (including the `#`). The
+    /// renderer drops these; a `#noindex` convention needs to see them.
+    Comment(String),
+    /// One row of a `` `t ``-delimited table, each cell inline-parsed into
+    /// spans. `render_table` renders cells from `cells`, so markup inside a
+    /// table cell (links, bold, ...) now renders live -- table cells were
+    /// not inline-parsed before this change; `raw` is kept for reference and
+    /// for cheap plain-text extraction.
+    TableRow { raw: String, cells: Vec<Vec<Span>> },
+    /// A `` `{url`refresh`fields} `` partial descriptor. Fields are kept as
+    /// the original raw strings; validation (e.g. is `refresh` a usable
+    /// number) is a rendering decision, done in `render_partial`.
+    Partial {
+        url: String,
+        refresh: String,
+        fields: String,
+    },
+    Heading {
+        depth: usize,
+        align: Option<Align>,
+        spans: Vec<Span>,
+    },
+    /// A `-`-led divider line, kept raw; `render_divider` (unchanged) derives
+    /// the glyph and run length from it.
+    Divider(String),
+    Blank,
+    Paragraph {
+        align: Option<Align>,
+        spans: Vec<Span>,
+    },
+}
+
+/// One inline run of a parsed line, in source order.
+#[derive(Clone)]
+pub enum Span {
+    Text { text: String, style: InlineState },
+    /// A `` `:name `` zero-width anchor. Carries no text.
+    Anchor { name: String },
+    /// A `` `[label`url] `` link. `url` is the raw, unsanitized target --
+    /// sanitization and cross-node URL rewriting are rendering concerns and
+    /// happen only in `render_spans`.
+    Link {
+        label: String,
+        url: String,
+        style: InlineState,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// Parses a Micron document into its line-level grammar. See `MicronLine`.
+pub fn parse_micron(bytes: &[u8]) -> Vec<MicronLine> {
     let text = String::from_utf8_lossy(bytes);
-    let mut out = String::new();
+    let mut lines_out = Vec::new();
     let mut literal = false;
-    let mut table: Option<Vec<String>> = None;
+    let mut in_table = false;
 
     // `lines()` rather than `split('\n')`: the trailing newline nearly every
     // page ends with would otherwise yield one extra empty segment, and that
@@ -17,16 +87,13 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
     for line in text.lines() {
         if line == "`=" {
             if literal {
-                out.push_str("</pre>\n");
-            } else {
-                out.push_str("<pre>");
+                lines_out.push(MicronLine::LiteralEnd);
             }
             literal = !literal;
             continue;
         }
         if literal {
-            out.push_str(&html_escape(line));
-            out.push('\n');
+            lines_out.push(MicronLine::Literal(line.to_string()));
             continue;
         }
 
@@ -39,29 +106,39 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
         };
 
         if !pre_escape && line.starts_with('#') {
+            lines_out.push(MicronLine::Comment(line.to_string()));
             continue;
         }
 
         if let Some(rest) = line.strip_prefix("`t") {
-            match table.take() {
-                Some(rows) => out.push_str(&render_table(&rows)),
-                None => table = Some(Vec::new()),
-            }
             let _ = rest;
+            in_table = !in_table;
             continue;
         }
-        if let Some(rows) = table.as_mut() {
-            rows.push(line.to_string());
+        if in_table {
+            let cells: Vec<Vec<Span>> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| parse_inline(cell.trim(), false).0)
+                .collect();
+            lines_out.push(MicronLine::TableRow {
+                raw: line.to_string(),
+                cells,
+            });
             continue;
         }
 
-        // `` `{url`refresh`fields} `` — a partial. We don't fetch partials, but
+        // `` `{url`refresh`fields} `` -- a partial. We don't fetch partials, but
         // the line must not fall through to inline parsing, which would consume
         // the backticks as formatting and spill the URL into visible text.
         if let Some(rest) = line.strip_prefix("`{")
-            && let Some(partial) = render_partial(rest)
+            && let Some((url, refresh, fields)) = parse_partial(rest)
         {
-            out.push_str(&partial);
+            lines_out.push(MicronLine::Partial {
+                url,
+                refresh,
+                fields,
+            });
             continue;
         }
 
@@ -75,16 +152,17 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
 
         if !pre_escape && let Some(depth) = heading_depth(line) {
             let level = depth.min(6);
-            let (html, align) = parse_inline(&line[depth..], false);
-            out.push_str(&format!(
-                "<h{level}{}>{html}</h{level}>\n",
-                align_attr(align)
-            ));
+            let (spans, align) = parse_inline(&line[depth..], false);
+            lines_out.push(MicronLine::Heading {
+                depth: level,
+                align,
+                spans,
+            });
             continue;
         }
 
         if !pre_escape && line.starts_with('-') {
-            out.push_str(&render_divider(line));
+            lines_out.push(MicronLine::Divider(line.to_string()));
             continue;
         }
 
@@ -94,17 +172,95 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
         // apart, since a margin applies between *every* pair of lines. The
         // space keeps the line box from collapsing to zero height.
         if line.trim().is_empty() {
-            out.push_str("<p> </p>\n");
+            lines_out.push(MicronLine::Blank);
             continue;
         }
 
-        let (html, align) = parse_inline(line, pre_escape);
-        out.push_str(&format!("<p{}>{html}</p>\n", align_attr(align)));
+        let (spans, align) = parse_inline(line, pre_escape);
+        lines_out.push(MicronLine::Paragraph { align, spans });
     }
 
-    if let Some(rows) = table.take() {
-        out.push_str(&render_table(&rows));
+    lines_out
+}
+
+/// Renders a parsed Micron document to HTML.
+fn render_html(lines: &[MicronLine]) -> String {
+    let mut out = String::new();
+    let mut in_literal = false;
+    let mut table_buf: Vec<Vec<Vec<Span>>> = Vec::new();
+
+    macro_rules! flush_table {
+        () => {
+            if !table_buf.is_empty() {
+                out.push_str(&render_table(&table_buf));
+                table_buf.clear();
+            }
+        };
     }
+
+    for line in lines {
+        match line {
+            MicronLine::Literal(text) => {
+                if !in_literal {
+                    out.push_str("<pre>");
+                    in_literal = true;
+                }
+                out.push_str(&html_escape(text));
+                out.push('\n');
+            }
+            MicronLine::LiteralEnd => {
+                out.push_str("</pre>\n");
+                in_literal = false;
+            }
+            MicronLine::Comment(_) => {}
+            MicronLine::TableRow { cells, .. } => {
+                table_buf.push(cells.clone());
+            }
+            MicronLine::Partial {
+                url,
+                refresh,
+                fields,
+            } => {
+                flush_table!();
+                out.push_str(&render_partial(url, refresh, fields));
+            }
+            MicronLine::Heading {
+                depth,
+                align,
+                spans,
+            } => {
+                flush_table!();
+                out.push_str(&format!(
+                    "<h{depth}{}>{}</h{depth}>\n",
+                    align_attr(*align),
+                    render_spans(spans)
+                ));
+            }
+            MicronLine::Divider(raw) => {
+                flush_table!();
+                out.push_str(&render_divider(raw));
+            }
+            MicronLine::Blank => {
+                flush_table!();
+                out.push_str("<p> </p>\n");
+            }
+            MicronLine::Paragraph { align, spans } => {
+                flush_table!();
+                out.push_str(&format!(
+                    "<p{}>{}</p>\n",
+                    align_attr(*align),
+                    render_spans(spans)
+                ));
+            }
+        }
+    }
+    flush_table!();
+    out
+}
+
+pub fn micron_to_html(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let out = render_html(&parse_micron(bytes));
 
     // `#!bg=` is still parsed, but deliberately not applied: Micron pages
     // always render on the dark page background the host document forces, so
@@ -173,10 +329,11 @@ fn render_divider(line: &str) -> String {
     )
 }
 
-/// Renders the `` `{url`refresh`fields} `` partial placeholder. The content
-/// isn't fetched — the element carries the descriptor so a caller could — but
-/// it renders as the reference's `⧖` marker rather than leaking raw markup.
-fn render_partial(rest: &str) -> Option<String> {
+/// Splits a `` `{url`refresh`fields} `` partial descriptor (the text right
+/// after the `` `{ `` marker) into its raw fields. Returns `None` when there
+/// is no closing `}` or the url is empty, in which case the caller falls
+/// through to ordinary line parsing rather than treating it as a partial.
+fn parse_partial(rest: &str) -> Option<(String, String, String)> {
     let end = rest.find('}')?;
     let data = &rest[..end];
     let mut parts = data.split('`');
@@ -186,7 +343,13 @@ fn render_partial(rest: &str) -> Option<String> {
     }
     let refresh = parts.next().unwrap_or("");
     let fields = parts.next().unwrap_or("");
+    Some((url.to_string(), refresh.to_string(), fields.to_string()))
+}
 
+/// Renders the `` `{url`refresh`fields} `` partial placeholder. The content
+/// isn't fetched — the element carries the descriptor so a caller could — but
+/// it renders as the reference's `⧖` marker rather than leaking raw markup.
+fn render_partial(url: &str, refresh: &str, fields: &str) -> String {
     let mut attrs = format!(" data-partial-url=\"{}\"", html_escape(url));
     if refresh.parse::<f64>().is_ok_and(|r| r >= 1.0) {
         attrs.push_str(&format!(" data-partial-refresh=\"{}\"", html_escape(refresh)));
@@ -194,7 +357,7 @@ fn render_partial(rest: &str) -> Option<String> {
     if !fields.is_empty() {
         attrs.push_str(&format!(" data-partial-fields=\"{}\"", html_escape(fields)));
     }
-    Some(format!("<div class=\"mu-partial\"{attrs}>\u{29d6}</div>\n"))
+    format!("<div class=\"mu-partial\"{attrs}>\u{29d6}</div>\n")
 }
 
 fn heading_depth(line: &str) -> Option<usize> {
@@ -206,15 +369,17 @@ fn heading_depth(line: &str) -> Option<usize> {
     }
 }
 
-fn align_attr(align: Option<&'static str>) -> String {
+fn align_attr(align: Option<Align>) -> String {
     match align {
-        Some(a) => format!(" style=\"text-align:{a}\""),
+        Some(Align::Center) => " style=\"text-align:center\"".to_string(),
+        Some(Align::Left) => " style=\"text-align:left\"".to_string(),
+        Some(Align::Right) => " style=\"text-align:right\"".to_string(),
         None => String::new(),
     }
 }
 
-#[derive(Default)]
-struct InlineState {
+#[derive(Clone, Default)]
+pub struct InlineState {
     bold: bool,
     underline: bool,
     italic: bool,
@@ -248,13 +413,16 @@ impl InlineState {
     }
 }
 
-/// Parses one line's inline formatting/link syntax. Returns the HTML and the
-/// last explicit alignment directive seen (`` `c``/`` `l``/`` `r``), if any.
-fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) {
-    let mut out = String::new();
+/// Parses one line's inline formatting/link syntax into spans, in source
+/// order, plus the last explicit alignment directive seen (`` `c``/`` `l``/
+/// `` `r``), if any. Structurally the same character walk the old HTML
+/// renderer used; only what gets emitted (a `Span` instead of an HTML
+/// fragment) has changed.
+fn parse_inline(line: &str, pre_escape: bool) -> (Vec<Span>, Option<Align>) {
+    let mut spans = Vec::new();
     let mut part = String::new();
     let mut state = InlineState::default();
-    let mut align: Option<&'static str> = None;
+    let mut align: Option<Align> = None;
 
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
@@ -273,7 +441,7 @@ fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) 
             } else if c == '\\' {
                 escape = true;
             } else if c == '`' {
-                flush(&mut out, &mut part, &state);
+                flush_span(&mut spans, &mut part, &state);
                 in_formatting = true;
             } else {
                 part.push(c);
@@ -288,9 +456,9 @@ fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) 
             '!' => state.bold = !state.bold,
             '*' => state.italic = !state.italic,
             '`' => state.reset(),
-            'c' => align = Some("center"),
-            'l' => align = Some("left"),
-            'r' => align = Some("right"),
+            'c' => align = Some(Align::Center),
+            'l' => align = Some(Align::Left),
+            'r' => align = Some(Align::Right),
             'a' => align = None,
             'f' => state.fg = None,
             'b' => state.bg = None,
@@ -312,12 +480,9 @@ fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) 
                     end += 1;
                 }
                 if end > start {
-                    flush(&mut out, &mut part, &state);
+                    flush_span(&mut spans, &mut part, &state);
                     let name: String = chars[start..end].iter().collect();
-                    out.push_str(&format!(
-                        "<a class=\"mu-anchor\" id=\"{}\" aria-hidden=\"true\"></a>",
-                        html_escape(&name)
-                    ));
+                    spans.push(Span::Anchor { name });
                     i = end;
                     continue;
                 }
@@ -333,19 +498,12 @@ fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) 
                         None => (first, first),
                     };
                     // A link sits inside the run of formatting it was opened
-                    // in, so it carries that run's style. Emitting it bare
-                    // dropped the weight and colour the page asked for, and
-                    // left the colour to reappear on whatever followed.
-                    let css = state.css();
-                    out.push_str("<a href=\"");
-                    out.push_str(&html_escape(&sanitize_url(url)));
-                    if !css.is_empty() {
-                        out.push_str("\" style=\"");
-                        out.push_str(&html_escape(&css));
-                    }
-                    out.push_str("\">");
-                    out.push_str(&html_escape(label));
-                    out.push_str("</a>");
+                    // in, so it carries that run's style through to rendering.
+                    spans.push(Span::Link {
+                        label: label.to_string(),
+                        url: url.to_string(),
+                        style: state.clone(),
+                    });
                     i += 1 + end;
                 }
             }
@@ -354,27 +512,65 @@ fn parse_inline(line: &str, pre_escape: bool) -> (String, Option<&'static str>) 
         i += 1;
     }
 
-    flush(&mut out, &mut part, &state);
-    (out, align)
+    flush_span(&mut spans, &mut part, &state);
+    (spans, align)
 }
 
-fn flush(out: &mut String, part: &mut String, state: &InlineState) {
+fn flush_span(spans: &mut Vec<Span>, part: &mut String, state: &InlineState) {
     if part.is_empty() {
         return;
     }
-    let css = state.css();
-    if css.is_empty() {
-        out.push_str(&html_escape(part));
-    } else {
-        out.push_str("<span style=\"");
-        // Escaped as well as validated at the source (`read_color`), so a
-        // future colour format can't silently reopen attribute injection.
-        out.push_str(&html_escape(&css));
-        out.push_str("\">");
-        out.push_str(&html_escape(part));
-        out.push_str("</span>");
-    }
+    spans.push(Span::Text {
+        text: part.clone(),
+        style: state.clone(),
+    });
     part.clear();
+}
+
+/// Renders parsed spans to HTML. Byte-identical to what the old character-walk
+/// renderer emitted directly for the same spans, with URL sanitization and
+/// cross-node rewriting applied here (not at parse time) so remote content is
+/// only ever neutralised on its way to a real webview, not before.
+fn render_spans(spans: &[Span]) -> String {
+    let mut out = String::new();
+    for span in spans {
+        match span {
+            Span::Text { text, style } => {
+                let css = style.css();
+                if css.is_empty() {
+                    out.push_str(&html_escape(text));
+                } else {
+                    out.push_str("<span style=\"");
+                    // Escaped as well as validated at the source (`read_color`),
+                    // so a future colour format can't silently reopen attribute
+                    // injection.
+                    out.push_str(&html_escape(&css));
+                    out.push_str("\">");
+                    out.push_str(&html_escape(text));
+                    out.push_str("</span>");
+                }
+            }
+            Span::Anchor { name } => {
+                out.push_str(&format!(
+                    "<a class=\"mu-anchor\" id=\"{}\" aria-hidden=\"true\"></a>",
+                    html_escape(name)
+                ));
+            }
+            Span::Link { label, url, style } => {
+                let css = style.css();
+                out.push_str("<a href=\"");
+                out.push_str(&html_escape(&sanitize_url(url)));
+                if !css.is_empty() {
+                    out.push_str("\" style=\"");
+                    out.push_str(&html_escape(&css));
+                }
+                out.push_str("\">");
+                out.push_str(&html_escape(label));
+                out.push_str("</a>");
+            }
+        }
+    }
+    out
 }
 
 /// Reads a Micron color code (3-hex shorthand, `gNN` grayscale, or `T` +
@@ -494,36 +690,52 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// Simplified table: buffered lines split on `|`; a second row made only of
+/// Plain-text content of a cell, used only to decide whether a row is a
+/// GFM-style `-`/`:` header separator -- not for rendering, which uses
+/// `render_spans` so markup inside a cell renders live.
+fn cell_text(cell: &[Span]) -> String {
+    let mut s = String::new();
+    for span in cell {
+        match span {
+            Span::Text { text, .. } => s.push_str(text),
+            Span::Link { label, .. } => s.push_str(label),
+            Span::Anchor { .. } => {}
+        }
+    }
+    s
+}
+
+/// Table: buffered rows of inline-parsed cells; a second row made only of
 /// `-`/`:` cells (GFM-style separator) marks the first row as a header.
-fn render_table(lines: &[String]) -> String {
-    let rows: Vec<Vec<String>> = lines
+///
+/// Cells are rendered through `render_spans`, so a cell containing Micron
+/// markup (links, bold, ...) now renders live rather than as escaped literal
+/// text -- table cells were not inline-parsed before this change.
+fn render_table(rows: &[Vec<Vec<Span>>]) -> String {
+    let rows: Vec<&Vec<Vec<Span>>> = rows
         .iter()
-        .map(|line| {
-            line.trim_matches('|')
-                .split('|')
-                .map(|cell| cell.trim().to_string())
-                .collect()
-        })
-        .filter(|row: &Vec<String>| !(row.len() == 1 && row[0].is_empty()))
+        .filter(|row| !(row.len() == 1 && row[0].is_empty()))
         .collect();
 
     if rows.is_empty() {
         return String::new();
     }
 
-    let is_separator = |row: &[String]| {
-        !row.is_empty() && row.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+    let is_separator = |row: &[Vec<Span>]| {
+        !row.is_empty() && row.iter().all(|cell| {
+            let text = cell_text(cell);
+            !text.is_empty() && text.chars().all(|ch| ch == '-' || ch == ':')
+        })
     };
 
     let mut out = String::from("<table>\n");
-    let has_header = rows.len() > 1 && is_separator(&rows[1]);
+    let has_header = rows.len() > 1 && is_separator(rows[1]);
     let body_start = if has_header {
         if let Some(first) = rows.first() {
             out.push_str("<thead><tr>");
-            for cell in first {
+            for cell in first.iter() {
                 out.push_str("<th>");
-                out.push_str(&html_escape(cell));
+                out.push_str(&render_spans(cell));
                 out.push_str("</th>");
             }
             out.push_str("</tr></thead>\n");
@@ -536,9 +748,9 @@ fn render_table(lines: &[String]) -> String {
     out.push_str("<tbody>\n");
     for row in rows.iter().skip(body_start) {
         out.push_str("<tr>");
-        for cell in row {
+        for cell in row.iter() {
             out.push_str("<td>");
-            out.push_str(&html_escape(cell));
+            out.push_str(&render_spans(cell));
             out.push_str("</td>");
         }
         out.push_str("</tr>\n");
@@ -1014,5 +1226,238 @@ mod tests {
              <p><a href=\"/page/about.mu\">about.mu</a></p>\n"
         );
     }
-}
 
+    // --- New behaviour from the parser/renderer split ----------------------
+
+    /// Table cells are now inline-parsed, so markup inside a cell (a link,
+    /// here) renders live instead of as escaped literal text. This is a real
+    /// behaviour change from the pre-split renderer, which only ever
+    /// `html_escape`d raw cell text -- see MicronLine::TableRow's docs.
+    #[test]
+    fn table_cell_markup_renders_live() {
+        let html = micron_to_html(b"`t\nName|Link\nAlice|`[Home`/page/index.mu]\n`t");
+        assert_eq!(
+            html,
+            "<table>\n<tbody>\n\
+             <tr><td>Name</td><td>Link</td></tr>\n\
+             <tr><td>Alice</td><td><a href=\"/page/index.mu\">Home</a></td></tr>\n\
+             </tbody></table>\n"
+        );
+    }
+
+    /// A literal block left open at end of document never gets a closing
+    /// `</pre>` -- upstream has no end-of-document flush for it (unlike
+    /// tables, which do flush at EOF). MicronLine::LiteralEnd exists
+    /// specifically to preserve this asymmetry through the parser/renderer
+    /// split; this is the one case it protects.
+    #[test]
+    fn literal_block_left_open_at_eof_has_no_closing_tag() {
+        let html = micron_to_html(b"`=\nunclosed");
+        assert_eq!(html, "<pre>unclosed\n");
+        assert!(!html.contains("</pre>"), "got: {html}");
+    }
+
+    /// Full-string regression corpus for every case above whose existing test
+    /// only checks `.contains(...)` -- those don't catch drift outside the
+    /// substring they check. Verified byte-for-byte (sha256-identical) across
+    /// the parser/renderer split via a throwaway golden-dump harness; these
+    /// literals are that verification's output, made permanent and re-run on
+    /// every future change instead of a one-off script.
+    #[test]
+    fn full_output_regression_corpus() {
+        let glyph_divider = |glyph: &str| -> String {
+            format!(
+                "<div class=\"mu-divider\" style=\"white-space:nowrap;overflow:hidden\">{}</div>\n",
+                glyph.repeat(DIVIDER_RUN)
+            )
+        };
+
+        let cases: &[(&str, &[u8], String)] = &[
+            (
+                "divider_with_glyph_repeats_that_glyph",
+                "-\u{223f}".as_bytes(),
+                glyph_divider("\u{223f}"),
+            ),
+            ("long_divider_uses_default_glyph", b"---", glyph_divider("\u{2500}")),
+            ("divider_glyph_is_escaped", b"-<", glyph_divider("&lt;")),
+            (
+                "anchor_does_not_leak_name_into_text",
+                b"`:myanchor jump target",
+                "<p><a class=\"mu-anchor\" id=\"myanchor\" aria-hidden=\"true\"></a> jump target</p>\n".to_string(),
+            ),
+            (
+                "anchor_name_is_escaped",
+                b"`:a-b_1 text",
+                "<p><a class=\"mu-anchor\" id=\"a-b_1\" aria-hidden=\"true\"></a> text</p>\n".to_string(),
+            ),
+            (
+                "partial_renders_placeholder_not_garbage",
+                b"`{/page/live.mu`5`pid=x}",
+                "<div class=\"mu-partial\" data-partial-url=\"/page/live.mu\" data-partial-refresh=\"5\" data-partial-fields=\"pid=x\">\u{29d6}</div>\n".to_string(),
+            ),
+            (
+                "partial_without_refresh_or_fields",
+                b"`{/page/x.mu}",
+                "<div class=\"mu-partial\" data-partial-url=\"/page/x.mu\">\u{29d6}</div>\n".to_string(),
+            ),
+            (
+                "link_inherits_the_formatting_run_it_sits_in#1",
+                b"`!`F00F`[Styled`:/p.mu]`! after",
+                "<p><a href=\"/p.mu\" style=\"font-weight:bold;color:#0000FF\">Styled</a><span style=\"color:#0000FF\"> after</span></p>\n".to_string(),
+            ),
+            (
+                "link_inherits_the_formatting_run_it_sits_in#2",
+                b"`[Plain`:/p.mu]",
+                "<p><a href=\"/p.mu\">Plain</a></p>\n".to_string(),
+            ),
+            (
+                "page_foreground_directive_follows_the_reference#1",
+                b"#!fg=abc\nHello\n",
+                "<div class=\"mu-page\" style=\"color:#abc\"><p>Hello</p>\n</div>\n".to_string(),
+            ),
+            (
+                "page_foreground_directive_follows_the_reference#2",
+                b">Title\ntext #!fg=fff\nmore\n",
+                "<div class=\"mu-page\" style=\"color:#fff\"><h1>Title</h1>\n<p>text #!fg=fff</p>\n<p>more</p>\n</div>\n".to_string(),
+            ),
+            ("page_foreground_directive_follows_the_reference#3", b"#!fg=ff\nx\n", "<p>x</p>\n".to_string()),
+            ("page_foreground_directive_follows_the_reference#4", b"#!fg=fffff\nx\n", "<p>x</p>\n".to_string()),
+            ("page_foreground_directive_follows_the_reference#5", b"#!fg=fff", "".to_string()),
+            ("page_foreground_directive_follows_the_reference#6", b"plain\n", "<p>plain</p>\n".to_string()),
+            (
+                "page_background_directive_is_parsed_but_never_applied#1",
+                b"#!bg=fff\nHello\n",
+                "<p>Hello</p>\n".to_string(),
+            ),
+            (
+                "page_background_directive_is_parsed_but_never_applied#2",
+                b"#!fg=abc\n#!bg=fff\nHello\n",
+                "<div class=\"mu-page\" style=\"color:#abc\"><p>Hello</p>\n</div>\n".to_string(),
+            ),
+            (
+                "inline_background_runs_survive_the_forced_page_background",
+                b"`B8F0`F000text",
+                "<p><span style=\"color:#000000;background-color:#88FF00\">text</span></p>\n".to_string(),
+            ),
+            (
+                "page_colour_is_not_hex_validated_but_stays_contained",
+                b"#!fg=\"><\nx\n",
+                "<div class=\"mu-page\" style=\"color:#&quot;&gt;&lt;\"><p>x</p>\n</div>\n".to_string(),
+            ),
+            (
+                "renders_simple_table_with_header",
+                b"`t\nName|Hops\n-|-\nAlice|2\n`t",
+                "<table>\n<thead><tr><th>Name</th><th>Hops</th></tr></thead>\n<tbody>\n<tr><td>Alice</td><td>2</td></tr>\n</tbody></table>\n".to_string(),
+            ),
+            (
+                "escapes_markup_in_ordinary_text",
+                b"x <script>alert(1)</script> <img src=x onerror=alert(2)>",
+                "<p>x &lt;script&gt;alert(1)&lt;/script&gt; &lt;img src=x onerror=alert(2)&gt;</p>\n".to_string(),
+            ),
+            (
+                "leading_angle_bracket_is_depth_reset_and_stays_inert",
+                b"<script>alert(1)</script>",
+                "<p>script&gt;alert(1)&lt;/script&gt;</p>\n".to_string(),
+            ),
+            (
+                "escapes_markup_in_heading",
+                b"><script>alert(1)</script>",
+                "<h1>&lt;script&gt;alert(1)&lt;/script&gt;</h1>\n".to_string(),
+            ),
+            (
+                "truecolor_directive_cannot_break_out_of_style_attribute",
+                b"`FT\"><img PWNED",
+                "<p> PWNED</p>\n".to_string(),
+            ),
+            (
+                "rejects_script_bearing_link_schemes#1",
+                b"`[x`javascript:alert(1)]",
+                "<p><a href=\"#blocked\">x</a></p>\n".to_string(),
+            ),
+            (
+                "rejects_script_bearing_link_schemes#2",
+                b"`[x`JaVaScRiPt:alert(1)]",
+                "<p><a href=\"#blocked\">x</a></p>\n".to_string(),
+            ),
+            (
+                "rejects_script_bearing_link_schemes#3",
+                b"`[x`java\tscript:alert(1)]",
+                "<p><a href=\"#blocked\">x</a></p>\n".to_string(),
+            ),
+            (
+                "rejects_script_bearing_link_schemes#4",
+                b"`[x`data:text/html,<script>alert(1)</script>]",
+                "<p><a href=\"#blocked\">x</a></p>\n".to_string(),
+            ),
+            (
+                "rejects_script_bearing_link_schemes#5",
+                b"`[x`vbscript:msgbox]",
+                "<p><a href=\"#blocked\">x</a></p>\n".to_string(),
+            ),
+            (
+                "rewrites_hash_colon_cross_node_link",
+                b"`[Other`a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6:/page/index.mu]",
+                "<p><a href=\"nomad://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/page/index.mu\">Other</a></p>\n".to_string(),
+            ),
+            (
+                "rewrites_nomadnetwork_scheme_cross_node_link",
+                b"`[Other`nomadnetwork://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/page/index.mu]",
+                "<p><a href=\"nomad://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/page/index.mu\">Other</a></p>\n".to_string(),
+            ),
+            (
+                "cross_node_link_without_leading_slash_gets_one",
+                b"`[Other`a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6:page/index.mu]",
+                "<p><a href=\"nomad://a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/page/index.mu\">Other</a></p>\n".to_string(),
+            ),
+            (
+                "non_hash_scheme_like_targets_are_left_alone#1",
+                b"`[m`mailto:a@b.c]",
+                "<p><a href=\"mailto:a@b.c\">m</a></p>\n".to_string(),
+            ),
+            (
+                "non_hash_scheme_like_targets_are_left_alone#2",
+                b"`[h`https://example.org/a]",
+                "<p><a href=\"https://example.org/a\">h</a></p>\n".to_string(),
+            ),
+            (
+                "rewrites_same_node_colon_prefixed_link",
+                b"`[Main page`:/page/index.mu]",
+                "<p><a href=\"/page/index.mu\">Main page</a></p>\n".to_string(),
+            ),
+            (
+                "rewrites_cross_node_colon_prefixed_link",
+                b"`[The Library`a2d4202e63899b472449c27d3e951257:/page/index.mu]",
+                "<p><a href=\"nomad://a2d4202e63899b472449c27d3e951257/page/index.mu\">The Library</a></p>\n".to_string(),
+            ),
+            (
+                "bare_hash_link_uses_default_path",
+                b"`[3881f480a71de26a8c2e6d637220f384]",
+                "<p><a href=\"nomad://3881f480a71de26a8c2e6d637220f384/page/index.mu\">3881f480a71de26a8c2e6d637220f384</a></p>\n".to_string(),
+            ),
+            (
+                "leaves_non_conforming_link_targets_untouched#1",
+                b"`[lxmf@7874a9d887f1d967b397d7577b47bdb8]",
+                "<p><a href=\"lxmf@7874a9d887f1d967b397d7577b47bdb8\">lxmf@7874a9d887f1d967b397d7577b47bdb8</a></p>\n".to_string(),
+            ),
+            (
+                "leaves_non_conforming_link_targets_untouched#2",
+                b"`[RT Radio`:https://codeberg.org/x]",
+                "<p><a href=\":https://codeberg.org/x\">RT Radio</a></p>\n".to_string(),
+            ),
+            (
+                "keeps_ordinary_link_targets_intact#1",
+                b"`[x`/page/a.mu]",
+                "<p><a href=\"/page/a.mu\">x</a></p>\n".to_string(),
+            ),
+            (
+                "keeps_ordinary_link_targets_intact#2",
+                b"`[x`https://example.org/a]",
+                "<p><a href=\"https://example.org/a\">x</a></p>\n".to_string(),
+            ),
+        ];
+
+        for (name, input, expected) in cases {
+            assert_eq!(&micron_to_html(input), expected, "case {name}");
+        }
+    }
+}
