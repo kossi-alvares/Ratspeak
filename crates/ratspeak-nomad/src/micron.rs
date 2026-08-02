@@ -58,11 +58,11 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
         // `` `{url`refresh`fields} `` — a partial. We don't fetch partials, but
         // the line must not fall through to inline parsing, which would consume
         // the backticks as formatting and spill the URL into visible text.
-        if let Some(rest) = line.strip_prefix("`{") {
-            if let Some(partial) = render_partial(rest) {
-                out.push_str(&partial);
-                continue;
-            }
+        if let Some(rest) = line.strip_prefix("`{")
+            && let Some(partial) = render_partial(rest)
+        {
+            out.push_str(&partial);
+            continue;
         }
 
         // A leading `<` resets section depth; the rest of the line is parsed
@@ -166,7 +166,7 @@ fn render_divider(line: &str) -> String {
     } else {
         '\u{2500}'
     };
-    let run: String = std::iter::repeat(glyph).take(DIVIDER_RUN).collect();
+    let run: String = std::iter::repeat_n(glyph, DIVIDER_RUN).collect();
     format!(
         "<div class=\"mu-divider\" style=\"white-space:nowrap;overflow:hidden\">{}</div>\n",
         html_escape(&run)
@@ -393,11 +393,11 @@ fn read_color(rest: &[char]) -> (Option<String>, usize) {
     }
     if rest.len() >= 3 {
         let code: String = rest[..3].iter().collect();
-        if let Some(gray) = code.strip_prefix('g') {
-            if let Ok(pct) = gray.parse::<u32>() {
-                let v = (pct.min(99) * 255) / 99;
-                return (Some(format!("rgb({v},{v},{v})")), 3);
-            }
+        if let Some(gray) = code.strip_prefix('g')
+            && let Ok(pct) = gray.parse::<u32>()
+        {
+            let v = (pct.min(99) * 255) / 99;
+            return (Some(format!("rgb({v},{v},{v})")), 3);
         }
         if code.chars().all(|c| c.is_ascii_hexdigit()) {
             let doubled: String = code.chars().flat_map(|c| [c, c]).collect();
