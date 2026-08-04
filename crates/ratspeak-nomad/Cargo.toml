@@ -11,3 +11,4 @@ rns-identity = { workspace = true }
 rns-runtime = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+rmpv = { workspace = true }

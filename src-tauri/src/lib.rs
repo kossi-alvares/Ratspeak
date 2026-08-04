@@ -268,13 +268,21 @@ fn open_external_url(url: String) -> Result<(), String> {
 /// that matters: it stops inline handlers and `javascript:` targets from
 /// running even if a page slips past the Micron sanitiser or is served as
 /// raw HTML by the remote node.
+///
+/// `form-action 'self'` (not `'none'`) is what lets a rendered Micron form
+/// (see `ratspeak_nomad::micron`) actually submit: a native `<form
+/// method="get">` GET-submission is not script execution, so it isn't
+/// blocked by `script-src`, only by this directive. `'self'` restricts a
+/// submission to the current page's own origin — i.e. the same
+/// `nomad://<identity-hash>`, not an arbitrary other node — which is the
+/// same trust boundary every other directive here already draws.
 const NOMAD_FRAME_CSP: &str = "default-src 'none'; \
      img-src 'self' data:; \
      style-src 'unsafe-inline'; \
      font-src data:; \
      script-src 'none'; \
      object-src 'none'; \
-     form-action 'none'; \
+     form-action 'self'; \
      base-uri 'none'";
 
 fn nomad_error_response(status: u16, message: &str) -> tauri::http::Response<Vec<u8>> {
@@ -299,8 +307,13 @@ async fn handle_nomad_request(
 
     let host = request.uri().host().unwrap_or("").to_string();
     let path = request.uri().path().to_string();
+    // A Micron form's native GET submission (see ratspeak_nomad::micron)
+    // lands its field values here as an ordinary URI query string -- no
+    // JavaScript involved, so this is the only place that ever sees them.
+    let payload =
+        ratspeak_tauri::nomad_browser::encode_form_payload(request.uri().query().unwrap_or(""));
 
-    match ratspeak_tauri::nomad_browser::fetch_for_uri(&state, &host, &path).await {
+    match ratspeak_tauri::nomad_browser::fetch_for_uri(&state, &host, &path, payload).await {
         Ok(resp) => {
             let mut builder = tauri::http::Response::builder()
                 .status(200)

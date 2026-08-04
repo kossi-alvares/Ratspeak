@@ -4434,6 +4434,7 @@ name = "ratspeak-nomad"
 version = "1.0.25"
 dependencies = [
  "nomad-core",
+ "rmpv",
  "rns-identity",
  "rns-runtime",
  "thiserror 2.0.18",

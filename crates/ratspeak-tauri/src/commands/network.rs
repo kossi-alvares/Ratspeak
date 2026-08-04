@@ -227,6 +227,7 @@ pub async fn api_nomad_file_download(
     }
     let host = uri.host().unwrap_or("").to_string();
     let path = uri.path().to_string();
+    let payload = ratspeak_nomad::encode_form_payload(uri.query().unwrap_or(""));
 
     // Forwards to a "nomad_download_progress" event (bytes_received/total_bytes,
     // same shape as lxmf_delivery_progress) so the Browser panel can show a real
@@ -243,10 +244,15 @@ pub async fn api_nomad_file_download(
         }
     });
 
-    let resp =
-        crate::nomad_browser::fetch_for_uri_with_progress(&state, &host, &path, progress_tx)
-            .await
-            .map_err(AppError::service_unavailable)?;
+    let resp = crate::nomad_browser::fetch_for_uri_with_progress(
+        &state,
+        &host,
+        &path,
+        payload,
+        progress_tx,
+    )
+    .await
+    .map_err(AppError::service_unavailable)?;
     let filename = resp.attachment_name.unwrap_or_else(|| "download".to_string());
     let mime = mime_guess::from_path(&filename)
         .first_or_octet_stream()
