@@ -1,9 +1,9 @@
 //! Small Micron -> HTML converter. Grammar follows NomadNet's reference
 //! parser (`nomadnet/ui/textui/MicronParser.py`): headings (`>`, `>>`, ...),
 //! horizontal dividers (lines starting with `-`), the `` `[label`url] `` link
-//! syntax, backtick-toggled bold/italic/underline/color spans, and
-//! `` `t ``-delimited tables. Forms, anchors and partials (NomadNet-specific,
-//! not needed for read-only browsing) are not implemented.
+//! syntax (plus its `` `[label`url`fields] `` submit-link form), backtick-toggled
+//! bold/italic/underline/color spans, `` `t ``-delimited tables, and
+//! `` `<name`text> ``-style form fields (text/password/checkbox/radio).
 //!
 //! `parse_micron` walks the grammar once into a `Vec<MicronLine>`; `render_html`
 //! (used by `micron_to_html`) is the only current consumer, but the AST is
@@ -59,12 +59,50 @@ pub enum Span {
     Anchor { name: String },
     /// A `` `[label`url] `` link. `url` is the raw, unsanitized target --
     /// sanitization and cross-node URL rewriting are rendering concerns and
-    /// happen only in `render_spans`.
+    /// happen only in `render_spans`. `fields` is the raw (unsplit) third
+    /// backtick-component when present and non-empty -- NomadNet's submit-link
+    /// form, e.g. `` `[Submit`:/page/hello.mu`*] ``. `None` for an ordinary
+    /// navigation link.
     Link {
         label: String,
         url: String,
+        fields: Option<String>,
         style: InlineState,
     },
+    /// A `` `<name`text> `` form field (and its `` `<flags|name|value|prechecked`label> ``
+    /// variant for checkbox/radio/password). Mirrors MicronParser.py's field
+    /// object exactly, including quirks -- see the `'<'` arm of `parse_inline`.
+    Field {
+        kind: FieldKind,
+        name: String,
+        /// Display width for a text field. Only meaningful for `Text`; can be
+        /// negative or huge -- Python clamps only the upper bound
+        /// (`min(int(field_flags), 256)`, `ValueError` falls back to 24), and
+        /// this matches that exactly rather than also clamping a lower bound.
+        /// `render_spans` guards it defensively when turning it into an HTML
+        /// attribute.
+        width: i64,
+        /// `Text` only: renders as `type="password"`.
+        masked: bool,
+        /// `Checkbox`/`Radio` only: the value submitted when checked/selected.
+        /// Falls back to `data` (the label) when the source component was
+        /// empty or absent -- both collapse to the same empty string here, so
+        /// one check covers both, matching Python's `field_value if field_value
+        /// else field_data`.
+        value: String,
+        /// `Checkbox`/`Radio` only.
+        prechecked: bool,
+        /// `Text`: the field's initial text. `Checkbox`/`Radio`: the visible
+        /// label.
+        data: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Text,
+    Checkbox,
+    Radio,
 }
 
 #[derive(Clone, Copy)]
@@ -260,7 +298,22 @@ fn render_html(lines: &[MicronLine]) -> String {
 
 pub fn micron_to_html(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let out = render_html(&parse_micron(bytes));
+    let parsed = parse_micron(bytes);
+    let body = render_html(&parsed);
+
+    // Wraps the whole page in one form when it has any field or submit link,
+    // so any submit button can collect any field regardless of where each
+    // sits in the document -- NomadNet has no smaller form-scoping concept
+    // for either. GET, not POST: the browser's own native query-string
+    // serialization on submit is what lands the field values in the
+    // `nomad://` request the scheme handler reads, with no JavaScript
+    // involved (the frame CSP still allows this: `form-action 'self'`, not
+    // `'none'`, is what makes the submit itself permitted).
+    let body = if document_has_form_elements(&parsed) {
+        format!("<form method=\"get\">{body}</form>\n")
+    } else {
+        body
+    };
 
     // `#!bg=` is still parsed, but deliberately not applied: Micron pages
     // always render on the dark page background the host document forces, so
@@ -269,9 +322,9 @@ pub fn micron_to_html(bytes: &[u8]) -> String {
     // readable, and inline colour runs keep working regardless.
     let (fg, _discarded_bg) = page_colors(&text);
     match fg {
-        None => out,
+        None => body,
         Some(fg) => format!(
-            "<div class=\"mu-page\" style=\"{}\">{out}</div>\n",
+            "<div class=\"mu-page\" style=\"{}\">{body}</div>\n",
             html_escape(&format!("color:{fg}"))
         ),
     }
@@ -493,19 +546,108 @@ fn parse_inline(line: &str, pre_escape: bool) -> (Vec<Span>, Option<Align>) {
                     let mut parts = link_data.splitn(3, '`');
                     let first = parts.next().unwrap_or("");
                     let url = parts.next();
+                    let raw_fields = parts.next();
                     let (label, url) = match url {
                         Some(url) => (first, url),
                         None => (first, first),
                     };
+                    // Present-but-empty and absent both mean "not a submit
+                    // link" (MicronParser.py: both collapse to `link_fields =
+                    // ""`, and only `if link_fields != "":` turns it into one).
+                    let fields = raw_fields.filter(|s| !s.is_empty()).map(str::to_string);
                     // A link sits inside the run of formatting it was opened
                     // in, so it carries that run's style through to rendering.
                     spans.push(Span::Link {
                         label: label.to_string(),
                         url: url.to_string(),
+                        fields,
                         style: state.clone(),
                     });
                     i += 1 + end;
                 }
+            }
+            // `` `<name`text> `` (or `` `<flags|name|value|prechecked`label> ``)
+            // — a form field. Mirrors MicronParser.py's `elif c == '<':` (inside
+            // its own "formatting mode" dispatch, i.e. only right after a
+            // backtick, exactly like `[` above) field-by-field, including its
+            // quirks: flag precedence is `^` (radio) before `?` (checkbox)
+            // before `!` (masked) -- not the reverse: only the first match in
+            // this if/elif chain is checked, remaining chars are left in
+            // `field_flags` and only ever matter for the width parse below.
+            '<' => {
+                let field_start = i + 1;
+                if let Some(backtick_rel) = chars[field_start..].iter().position(|&c| c == '`') {
+                    let backtick_pos = field_start + backtick_rel;
+                    let field_content: String = chars[field_start..backtick_pos].iter().collect();
+
+                    let mut kind = FieldKind::Text;
+                    let mut masked = false;
+                    let mut width: i64 = 24;
+                    let mut name = field_content.clone();
+                    let mut value = String::new();
+                    let mut prechecked = false;
+
+                    if field_content.contains('|') {
+                        let f_components: Vec<&str> = field_content.split('|').collect();
+                        let mut field_flags = f_components[0].to_string();
+                        name = f_components.get(1).copied().unwrap_or("").to_string();
+
+                        if field_flags.contains('^') {
+                            kind = FieldKind::Radio;
+                            field_flags = field_flags.replace('^', "");
+                        } else if field_flags.contains('?') {
+                            kind = FieldKind::Checkbox;
+                            field_flags = field_flags.replace('?', "");
+                        } else if field_flags.contains('!') {
+                            field_flags = field_flags.replace('!', "");
+                            masked = true;
+                        }
+
+                        // `int()` on the whole remaining flag string; invalid
+                        // (including empty) falls back to 24. `min(x, 256)`
+                        // only -- no lower bound, so a negative width survives
+                        // parsing unclamped (see the `width` field's doc).
+                        if !field_flags.is_empty()
+                            && let Ok(parsed) = field_flags.parse::<i64>()
+                        {
+                            width = parsed.min(256);
+                        }
+
+                        value = f_components.get(2).copied().unwrap_or("").to_string();
+                        prechecked = f_components.get(3).copied() == Some("*");
+                    }
+
+                    if let Some(gt_rel) = chars[backtick_pos + 1..].iter().position(|&c| c == '>') {
+                        let field_end = backtick_pos + 1 + gt_rel;
+                        let data: String = chars[backtick_pos + 1..field_end].iter().collect();
+
+                        flush_span(&mut spans, &mut part, &state);
+                        spans.push(match kind {
+                            FieldKind::Checkbox | FieldKind::Radio => Span::Field {
+                                kind,
+                                name,
+                                width: 24,
+                                masked: false,
+                                value: if value.is_empty() { data.clone() } else { value },
+                                prechecked,
+                                data,
+                            },
+                            FieldKind::Text => Span::Field {
+                                kind,
+                                name,
+                                width,
+                                masked,
+                                value: String::new(),
+                                prechecked: false,
+                                data,
+                            },
+                        });
+                        i = field_end;
+                    }
+                    // No closing '>': malformed, drop the '<' silently --
+                    // matches Python's bare `except: pass`.
+                }
+                // No closing '`' after '<': same, drop it silently.
             }
             _ => {}
         }
@@ -556,21 +698,123 @@ fn render_spans(spans: &[Span]) -> String {
                     html_escape(name)
                 ));
             }
-            Span::Link { label, url, style } => {
+            Span::Link {
+                label,
+                url,
+                fields,
+                style,
+            } => {
                 let css = style.css();
-                out.push_str("<a href=\"");
-                out.push_str(&html_escape(&sanitize_url(url)));
-                if !css.is_empty() {
-                    out.push_str("\" style=\"");
-                    out.push_str(&html_escape(&css));
+                match fields {
+                    // A submit link (non-empty third component). Rendered as a
+                    // submit button rather than an `<a>` so a native click
+                    // collects the page's form fields and GETs to `url` --
+                    // no JavaScript involved, so this works despite the
+                    // frame's `script-src 'none'` CSP.
+                    //
+                    // ponytail: always submits every field on the page,
+                    // regardless of the link's declared subset (a specific
+                    // name list, or `*` for "all" -- the only case the actual
+                    // example fixture uses). nodepage-rs/.rhai scripts only
+                    // ever read fields by name, so the extras are inert; a
+                    // literal `key=value` pair in the fields list (Browser.py
+                    // also supports this, separate from named page fields) is
+                    // not carried through at all. Upgrade path if a page needs
+                    // either: give each submit button its own `<form id>` and
+                    // route the fields it wants via the HTML `form=` attribute.
+                    Some(_fields) => {
+                        out.push_str("<button type=\"submit\" formaction=\"");
+                        out.push_str(&html_escape(&sanitize_url(url)));
+                        out.push_str("\" class=\"mu-submit\"");
+                        if !css.is_empty() {
+                            out.push_str(" style=\"");
+                            out.push_str(&html_escape(&css));
+                            out.push('"');
+                        }
+                        out.push('>');
+                        out.push_str(&html_escape(label));
+                        out.push_str("</button>");
+                    }
+                    None => {
+                        out.push_str("<a href=\"");
+                        out.push_str(&html_escape(&sanitize_url(url)));
+                        if !css.is_empty() {
+                            out.push_str("\" style=\"");
+                            out.push_str(&html_escape(&css));
+                        }
+                        out.push_str("\">");
+                        out.push_str(&html_escape(label));
+                        out.push_str("</a>");
+                    }
                 }
-                out.push_str("\">");
-                out.push_str(&html_escape(label));
-                out.push_str("</a>");
+            }
+            Span::Field {
+                kind,
+                name,
+                width,
+                masked,
+                value,
+                prechecked,
+                data,
+            } => {
+                // NomadNet's own field-name key: `request_data["field_" +
+                // name]` (Browser.py). Naming the input this way means the
+                // browser's own GET-query serialization already produces the
+                // exact wire key nodepage-rs's `decode_fields` expects --
+                // no client-side renaming needed.
+                let field_name = html_escape(&format!("field_{name}"));
+                match kind {
+                    FieldKind::Text => {
+                        let input_type = if *masked { "password" } else { "text" };
+                        // Cosmetic only, and only in the positive range --
+                        // `width` itself is left exactly as parsed (see its
+                        // doc), never clamped, to keep parsing faithful to
+                        // Python; only the *rendering* guards a nonsensical
+                        // HTML attribute value.
+                        let size = if *width >= 1 { *width } else { 24 };
+                        out.push_str(&format!(
+                            "<input type=\"{input_type}\" name=\"{field_name}\" value=\"{}\" size=\"{size}\" class=\"mu-field\">",
+                            html_escape(data)
+                        ));
+                    }
+                    FieldKind::Checkbox | FieldKind::Radio => {
+                        let input_type = if *kind == FieldKind::Radio { "radio" } else { "checkbox" };
+                        out.push_str(&format!(
+                            "<label class=\"mu-field-label\"><input type=\"{input_type}\" name=\"{field_name}\" value=\"{}\"{}> {}</label>",
+                            html_escape(value),
+                            if *prechecked { " checked" } else { "" },
+                            html_escape(data)
+                        ));
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// Whether any line in the document contains a form element (a field, or a
+/// submit link) -- if so, `micron_to_html` wraps the whole body in one
+/// `<form>` so any submit button anywhere on the page can collect any field
+/// anywhere on the page, matching how NomadNet's own fields/links are not
+/// scoped to any smaller container.
+fn document_has_form_elements(lines: &[MicronLine]) -> bool {
+    fn spans_have_form_elements(spans: &[Span]) -> bool {
+        spans.iter().any(|s| {
+            matches!(
+                s,
+                Span::Field { .. } | Span::Link { fields: Some(_), .. }
+            )
+        })
+    }
+
+    lines.iter().any(|line| match line {
+        MicronLine::Heading { spans, .. } | MicronLine::Paragraph { spans, .. } => {
+            spans_have_form_elements(spans)
+        }
+        MicronLine::TableRow { cells, .. } => cells.iter().any(|c| spans_have_form_elements(c)),
+        _ => false,
+    })
 }
 
 /// Reads a Micron color code (3-hex shorthand, `gNN` grayscale, or `T` +
@@ -700,6 +944,7 @@ fn cell_text(cell: &[Span]) -> String {
             Span::Text { text, .. } => s.push_str(text),
             Span::Link { label, .. } => s.push_str(label),
             Span::Anchor { .. } => {}
+            Span::Field { data, .. } => s.push_str(data),
         }
     }
     s
@@ -762,6 +1007,129 @@ fn render_table(rows: &[Vec<Vec<Span>>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_plain_text_field_and_wraps_page_in_a_form() {
+        assert_eq!(
+            micron_to_html(b"`<username`Anonymous>"),
+            "<form method=\"get\"><p><input type=\"text\" name=\"field_username\" value=\"Anonymous\" size=\"24\" class=\"mu-field\"></p>\n</form>\n"
+        );
+    }
+
+    #[test]
+    fn page_with_no_fields_or_submit_links_is_not_wrapped_in_a_form() {
+        assert_eq!(micron_to_html(b"just text"), "<p>just text</p>\n");
+    }
+
+    #[test]
+    fn masked_field_renders_as_password_input() {
+        let html = micron_to_html(b"`<!24|secret`hunter2>");
+        assert!(
+            html.contains("type=\"password\""),
+            "expected a password input: {html}"
+        );
+    }
+
+    /// Known correction #1: Python checks `^` (radio) before `?` (checkbox) --
+    /// a flags string containing both is a radio, not a checkbox.
+    #[test]
+    fn flag_precedence_radio_before_checkbox() {
+        let html = micron_to_html(b"`<^?|opt`Option>");
+        assert!(html.contains("type=\"radio\""), "expected radio: {html}");
+        assert!(!html.contains("type=\"checkbox\""), "must not be checkbox: {html}");
+    }
+
+    /// Known correction #2: width is `min(int(field_flags), 256)` -- the
+    /// whole flags string as one int, no lower bound, `ValueError` (not just
+    /// "non-digit") falls back to 24.
+    #[test]
+    fn width_parsing_matches_pythons_int_semantics() {
+        assert!(micron_to_html(b"`<64|w`text>").contains("size=\"64\""));
+        // Upper-bounded, not lower-bounded: min(300, 256) = 256.
+        assert!(micron_to_html(b"`<300|w`text>").contains("size=\"256\""));
+        // Not parseable as int at all -> falls back to 24 (rendering guards
+        // the HTML attribute; the underlying field itself would be -5, not
+        // clamped -- see width_can_be_negative_and_is_not_clamped_at_parse_time).
+        assert!(micron_to_html(b"`<abc|w`text>").contains("size=\"24\""));
+    }
+
+    #[test]
+    fn width_can_be_negative_and_is_not_clamped_at_parse_time() {
+        let spans = parse_inline("`<-5|w`text>", false).0;
+        match &spans[0] {
+            Span::Field { width, .. } => assert_eq!(*width, -5, "width must not be clamped to a lower bound"),
+            _ => panic!("expected a Field span"),
+        }
+        // Rendering still guards against a nonsensical HTML attribute.
+        assert!(micron_to_html(b"`<-5|w`text>").contains("size=\"24\""));
+    }
+
+    /// Known correction #3: an *empty* value component falls back to the
+    /// label, same as an *absent* one -- not just "absent".
+    #[test]
+    fn checkbox_value_falls_back_to_label_when_component_is_empty_or_absent() {
+        // Absent (no third component at all).
+        let html = micron_to_html(b"`<?|agree`I agree>");
+        assert!(html.contains("value=\"I agree\""), "{html}");
+        // Present but empty.
+        let html = micron_to_html(b"`<?|agree|`I agree>");
+        assert!(html.contains("value=\"I agree\""), "{html}");
+        // Present and non-empty: kept as-is, not overridden by the label.
+        let html = micron_to_html(b"`<?|agree|yes`I agree>");
+        assert!(html.contains("value=\"yes\""), "{html}");
+    }
+
+    #[test]
+    fn radio_prechecked_marker_sets_the_checked_attribute() {
+        let html = micron_to_html(b"`<^|opt|val|*`Option>");
+        assert!(html.contains("checked"), "{html}");
+    }
+
+    /// Known correction #4: Python has no field-name validation at all --
+    /// deliberately not carrying over rsNomadNet's `[A-Za-z0-9_-]`
+    /// restriction (see the module/commit notes). A name with characters
+    /// outside that set must still round-trip, HTML-escaped like any other
+    /// attribute value here, not rejected or stripped.
+    #[test]
+    fn field_names_are_not_restricted_to_a_safe_character_set() {
+        let html = micron_to_html(b"`<a.b c`text>");
+        assert!(
+            html.contains("name=\"field_a.b c\""),
+            "field name must pass through unrestricted: {html}"
+        );
+    }
+
+    #[test]
+    fn submit_link_renders_as_a_button_not_an_anchor() {
+        let html = micron_to_html(b"`[Submit`:/page/hello.mu`*]");
+        // `:/page/hello.mu` (same-node, colon-prefixed) is rewritten to the
+        // plain relative path by the same rewrite_cross_node_url ordinary
+        // links already go through.
+        assert!(
+            html.contains("<button type=\"submit\" formaction=\"/page/hello.mu\""),
+            "{html}"
+        );
+        assert!(!html.contains("<a "), "must not also render as a plain link: {html}");
+    }
+
+    #[test]
+    fn ordinary_two_component_link_is_unaffected_by_the_fields_addition() {
+        assert_eq!(
+            micron_to_html(b"`[Click here`/page/other.mu]"),
+            "<p><a href=\"/page/other.mu\">Click here</a></p>\n"
+        );
+    }
+
+    /// The exact fixture shipped in rsNodePage's examples/pages/index.mu.
+    #[test]
+    fn renders_the_real_index_mu_fixture_with_a_working_form() {
+        let html = micron_to_html(
+            b"> Rust node pages\n\nUser name: `B444`<username`Anonymous>`b\n\n`[Submit`:/page/hello.mu`*]\n",
+        );
+        assert!(html.starts_with("<form method=\"get\">"), "{html}");
+        assert!(html.contains("name=\"field_username\" value=\"Anonymous\""), "{html}");
+        assert!(html.contains("<button type=\"submit\" formaction=\"/page/hello.mu\""), "{html}");
+    }
 
     #[test]
     fn renders_heading_levels() {
